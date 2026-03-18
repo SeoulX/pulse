@@ -1,0 +1,12 @@
+services:
+  app:
+    build: .
+    ports:
+      - "3000:3000"
+    env_file:
+      - .env.local
+    extra_hosts:
+      - "cluster0-shard-00-00.7mbnl.mongodb.net:159.143.173.101"
+      - "cluster0-shard-00-01.7mbnl.mongodb.net:159.143.173.140"
+      - "cluster0-shard-00-02.7mbnl.mongodb.net:159.143.173.124"
+    restart: unless-stopped
