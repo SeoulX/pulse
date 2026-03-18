@@ -11,7 +11,37 @@ interface EndpointFormProps {
   endpointId?: string;
 }
 
+interface DiscoveredEndpoint {
+  method: string;
+  path: string;
+  fullUrl: string;
+  summary: string;
+  operationId: string;
+}
+
+interface DiscoverResult {
+  specUrl: string;
+  apiTitle: string;
+  apiVersion: string;
+  endpoints: DiscoveredEndpoint[];
+}
+
 const HTTP_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"];
+
+const inputClass =
+  "w-full rounded-xl border bg-background px-4 py-2.5 text-sm outline-none transition-all focus:border-[#e8871e] focus:ring-2 focus:ring-[#e8871e]/20 dark:focus:border-[#2a7f9e] dark:focus:ring-[#2a7f9e]/20";
+
+interface ExistingEndpoint {
+  _id: string;
+  name: string;
+  alertEnabled: boolean;
+  alertThreshold: number;
+  notifications: {
+    email: { enabled: boolean; address?: string };
+    discord: { enabled: boolean; webhookUrl?: string };
+    webhook: { enabled: boolean; url?: string };
+  };
+}
 
 export function EndpointForm({
   mode,
@@ -20,8 +50,15 @@ export function EndpointForm({
 }: EndpointFormProps) {
   const router = useRouter();
   const { data: projects } = useSWR<ProjectData[]>("/api/projects");
+  const { data: existingEndpoints } = useSWR<ExistingEndpoint[]>("/api/endpoints");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
+
+  // API Discovery state
+  const [discoverUrl, setDiscoverUrl] = useState("");
+  const [discovering, setDiscovering] = useState(false);
+  const [discoverResult, setDiscoverResult] = useState<DiscoverResult | null>(null);
+  const [discoverError, setDiscoverError] = useState("");
 
   const [form, setForm] = useState({
     projectId: (initialData?.projectId as string) || "",
@@ -44,6 +81,36 @@ export function EndpointForm({
 
   const [headerKey, setHeaderKey] = useState("");
   const [headerValue, setHeaderValue] = useState("");
+
+  async function handleDiscover() {
+    if (!discoverUrl) return;
+    setDiscovering(true);
+    setDiscoverError("");
+    setDiscoverResult(null);
+    try {
+      const res = await fetch("/api/discover", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ baseUrl: discoverUrl }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || "Discovery failed");
+      setDiscoverResult(data);
+    } catch (err) {
+      setDiscoverError((err as Error).message);
+    } finally {
+      setDiscovering(false);
+    }
+  }
+
+  function selectDiscoveredEndpoint(ep: DiscoveredEndpoint) {
+    setForm((prev) => ({
+      ...prev,
+      name: discoverResult?.apiTitle || ep.summary || ep.operationId || "Endpoint",
+      url: ep.fullUrl,
+      method: ep.method,
+    }));
+  }
 
   function addHeader() {
     if (!headerKey) return;
@@ -106,6 +173,102 @@ export function EndpointForm({
         </div>
       )}
 
+      {/* API Discovery */}
+      {mode === "create" && (
+        <div className="space-y-3 rounded-2xl border border-dashed border-[#e8871e]/40 dark:border-[#2a7f9e]/40 p-5">
+          <div>
+            <label className="mb-1 block text-sm font-medium">
+              Discover from API
+            </label>
+            <p className="mb-2 text-xs text-muted-foreground">
+              Paste an API base URL to auto-discover endpoints from its OpenAPI/Swagger spec
+            </p>
+            <div className="flex gap-2">
+              <input
+                type="url"
+                placeholder="https://api.example.com"
+                value={discoverUrl}
+                onChange={(e) => setDiscoverUrl(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") {
+                    e.preventDefault();
+                    handleDiscover();
+                  }
+                }}
+                className={inputClass}
+              />
+              <button
+                type="button"
+                onClick={handleDiscover}
+                disabled={discovering || !discoverUrl}
+                className="shrink-0 rounded-xl bg-[#e8871e] px-4 py-2.5 text-sm font-medium text-white transition-colors hover:bg-[#d07518] dark:bg-[#2a7f9e] dark:hover:bg-[#1e6b87] disabled:opacity-50"
+              >
+                {discovering ? "Scanning..." : "Discover"}
+              </button>
+            </div>
+          </div>
+
+          {discoverError && (
+            <div className="rounded-xl bg-red-50 dark:bg-red-900/20 p-3 text-sm text-red-700 dark:text-red-400">
+              {discoverError}
+            </div>
+          )}
+
+          {discoverResult && (
+            <div className="space-y-2">
+              <p className="text-sm font-medium">
+                {discoverResult.apiTitle}
+                {discoverResult.apiVersion && (
+                  <span className="ml-1 text-xs text-muted-foreground">
+                    v{discoverResult.apiVersion}
+                  </span>
+                )}
+                <span className="ml-2 text-xs text-muted-foreground">
+                  ({discoverResult.endpoints.length} endpoints found)
+                </span>
+              </p>
+              <div className="max-h-60 overflow-y-auto rounded-xl border divide-y">
+                {discoverResult.endpoints.map((ep, i) => (
+                  <button
+                    key={i}
+                    type="button"
+                    onClick={() => selectDiscoveredEndpoint(ep)}
+                    className="flex w-full items-center gap-3 px-3 py-2 text-left text-sm transition-colors hover:bg-muted/50"
+                  >
+                    <span
+                      className={`shrink-0 rounded px-1.5 py-0.5 text-xs font-mono font-bold ${
+                        ep.method === "GET"
+                          ? "bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400"
+                          : ep.method === "POST"
+                            ? "bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-400"
+                            : ep.method === "PUT" || ep.method === "PATCH"
+                              ? "bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400"
+                              : ep.method === "DELETE"
+                                ? "bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-400"
+                                : "bg-gray-100 text-gray-700 dark:bg-gray-800 dark:text-gray-400"
+                      }`}
+                    >
+                      {ep.method}
+                    </span>
+                    <span className="font-mono text-xs truncate">
+                      {ep.path}
+                    </span>
+                    {ep.summary && (
+                      <span className="ml-auto truncate text-xs text-muted-foreground">
+                        {ep.summary}
+                      </span>
+                    )}
+                  </button>
+                ))}
+              </div>
+              <p className="text-xs text-muted-foreground">
+                Click an endpoint to auto-fill the form below
+              </p>
+            </div>
+          )}
+        </div>
+      )}
+
       <div className="space-y-4">
         <div>
           <label className="mb-1 block text-sm font-medium">Project</label>
@@ -114,7 +277,7 @@ export function EndpointForm({
             onChange={(e) =>
               setForm({ ...form, projectId: e.target.value || "" })
             }
-            className="w-full rounded-xl border bg-background px-4 py-2.5 text-sm outline-none transition-all focus:border-[#e8871e] focus:ring-2 focus:ring-[#e8871e]/20 dark:focus:border-[#2a7f9e] dark:focus:ring-[#2a7f9e]/20"
+            className={inputClass}
           >
             <option value="">No Project</option>
             {projects?.map((p) => (
@@ -132,7 +295,7 @@ export function EndpointForm({
             required
             value={form.name}
             onChange={(e) => setForm({ ...form, name: e.target.value })}
-            className="w-full w-full rounded-xl border bg-background px-4 py-2.5 text-sm outline-none transition-all focus:border-[#e8871e] focus:ring-2 focus:ring-[#e8871e]/20 dark:focus:border-[#2a7f9e] dark:focus:ring-[#2a7f9e]/20"
+            className={inputClass}
             placeholder="Payment API"
           />
         </div>
@@ -144,7 +307,7 @@ export function EndpointForm({
             required
             value={form.url}
             onChange={(e) => setForm({ ...form, url: e.target.value })}
-            className="w-full w-full rounded-xl border bg-background px-4 py-2.5 text-sm outline-none transition-all focus:border-[#e8871e] focus:ring-2 focus:ring-[#e8871e]/20 dark:focus:border-[#2a7f9e] dark:focus:ring-[#2a7f9e]/20"
+            className={inputClass}
             placeholder="https://api.example.com/health"
           />
         </div>
@@ -155,7 +318,7 @@ export function EndpointForm({
             <select
               value={form.method}
               onChange={(e) => setForm({ ...form, method: e.target.value })}
-              className="w-full w-full rounded-xl border bg-background px-4 py-2.5 text-sm outline-none transition-all focus:border-[#e8871e] focus:ring-2 focus:ring-[#e8871e]/20 dark:focus:border-[#2a7f9e] dark:focus:ring-[#2a7f9e]/20"
+              className={inputClass}
             >
               {HTTP_METHODS.map((m) => (
                 <option key={m} value={m}>
@@ -178,7 +341,7 @@ export function EndpointForm({
                   expectedStatusCode: parseInt(e.target.value),
                 })
               }
-              className="w-full w-full rounded-xl border bg-background px-4 py-2.5 text-sm outline-none transition-all focus:border-[#e8871e] focus:ring-2 focus:ring-[#e8871e]/20 dark:focus:border-[#2a7f9e] dark:focus:ring-[#2a7f9e]/20"
+              className={inputClass}
             />
           </div>
         </div>
@@ -196,7 +359,7 @@ export function EndpointForm({
               onChange={(e) =>
                 setForm({ ...form, interval: parseInt(e.target.value) })
               }
-              className="w-full w-full rounded-xl border bg-background px-4 py-2.5 text-sm outline-none transition-all focus:border-[#e8871e] focus:ring-2 focus:ring-[#e8871e]/20 dark:focus:border-[#2a7f9e] dark:focus:ring-[#2a7f9e]/20"
+              className={inputClass}
             />
           </div>
 
@@ -212,7 +375,7 @@ export function EndpointForm({
               onChange={(e) =>
                 setForm({ ...form, timeout: parseInt(e.target.value) })
               }
-              className="w-full w-full rounded-xl border bg-background px-4 py-2.5 text-sm outline-none transition-all focus:border-[#e8871e] focus:ring-2 focus:ring-[#e8871e]/20 dark:focus:border-[#2a7f9e] dark:focus:ring-[#2a7f9e]/20"
+              className={inputClass}
             />
           </div>
         </div>
@@ -242,14 +405,14 @@ export function EndpointForm({
               placeholder="Key"
               value={headerKey}
               onChange={(e) => setHeaderKey(e.target.value)}
-              className="flex-1 w-full rounded-xl border bg-background px-4 py-2.5 text-sm outline-none transition-all focus:border-[#e8871e] focus:ring-2 focus:ring-[#e8871e]/20 dark:focus:border-[#2a7f9e] dark:focus:ring-[#2a7f9e]/20"
+              className={`flex-1 ${inputClass}`}
             />
             <input
               type="text"
               placeholder="Value"
               value={headerValue}
               onChange={(e) => setHeaderValue(e.target.value)}
-              className="flex-1 w-full rounded-xl border bg-background px-4 py-2.5 text-sm outline-none transition-all focus:border-[#e8871e] focus:ring-2 focus:ring-[#e8871e]/20 dark:focus:border-[#2a7f9e] dark:focus:ring-[#2a7f9e]/20"
+              className={`flex-1 ${inputClass}`}
             />
             <button
               type="button"
@@ -271,7 +434,7 @@ export function EndpointForm({
               value={form.body}
               onChange={(e) => setForm({ ...form, body: e.target.value })}
               rows={4}
-              className="w-full w-full rounded-xl border bg-background px-4 py-2.5 text-sm outline-none transition-all focus:border-[#e8871e] focus:ring-2 focus:ring-[#e8871e]/20 dark:focus:border-[#2a7f9e] dark:focus:ring-[#2a7f9e]/20 font-mono"
+              className={`${inputClass} font-mono`}
               placeholder='{"key": "value"}'
             />
           </div>
@@ -293,6 +456,65 @@ export function EndpointForm({
 
           {form.alertEnabled && (
             <>
+              {/* Copy notification config from existing endpoint */}
+              {(() => {
+                const configured = existingEndpoints?.filter(
+                  (ep) =>
+                    ep._id !== endpointId &&
+                    ep.alertEnabled &&
+                    (ep.notifications?.email?.enabled ||
+                      ep.notifications?.discord?.enabled ||
+                      ep.notifications?.webhook?.enabled)
+                );
+                if (!configured?.length) return null;
+                return (
+                  <div>
+                    <label className="mb-1 block text-sm font-medium">
+                      Copy from existing
+                    </label>
+                    <select
+                      value=""
+                      onChange={(e) => {
+                        const ep = configured.find((x) => x._id === e.target.value);
+                        if (!ep) return;
+                        setForm((prev) => ({
+                          ...prev,
+                          alertThreshold: ep.alertThreshold,
+                          notifications: {
+                            email: {
+                              enabled: ep.notifications?.email?.enabled || false,
+                              address: ep.notifications?.email?.address || "",
+                            },
+                            discord: {
+                              enabled: ep.notifications?.discord?.enabled || false,
+                              webhookUrl: ep.notifications?.discord?.webhookUrl || "",
+                            },
+                            webhook: {
+                              enabled: ep.notifications?.webhook?.enabled || false,
+                              url: ep.notifications?.webhook?.url || "",
+                            },
+                          },
+                        }));
+                      }}
+                      className={inputClass}
+                    >
+                      <option value="">Select endpoint to copy config from...</option>
+                      {configured.map((ep) => {
+                        const channels: string[] = [];
+                        if (ep.notifications?.email?.enabled) channels.push("Email");
+                        if (ep.notifications?.discord?.enabled) channels.push("Discord");
+                        if (ep.notifications?.webhook?.enabled) channels.push("Webhook");
+                        return (
+                          <option key={ep._id} value={ep._id}>
+                            {ep.name} ({channels.join(", ")})
+                          </option>
+                        );
+                      })}
+                    </select>
+                  </div>
+                );
+              })()}
+
               <div>
                 <label className="mb-1 block text-sm font-medium">
                   After consecutive failures
@@ -308,7 +530,7 @@ export function EndpointForm({
                       alertThreshold: parseInt(e.target.value),
                     })
                   }
-                  className="w-32 w-full rounded-xl border bg-background px-4 py-2.5 text-sm outline-none transition-all focus:border-[#e8871e] focus:ring-2 focus:ring-[#e8871e]/20 dark:focus:border-[#2a7f9e] dark:focus:ring-[#2a7f9e]/20"
+                  className={inputClass}
                 />
               </div>
 
@@ -371,7 +593,7 @@ export function EndpointForm({
                         },
                       })
                     }
-                    className="w-full w-full rounded-xl border bg-background px-4 py-2.5 text-sm outline-none transition-all focus:border-[#e8871e] focus:ring-2 focus:ring-[#e8871e]/20 dark:focus:border-[#2a7f9e] dark:focus:ring-[#2a7f9e]/20"
+                    className={inputClass}
                   />
                 )}
 
@@ -431,7 +653,7 @@ export function EndpointForm({
                         },
                       })
                     }
-                    className="w-full w-full rounded-xl border bg-background px-4 py-2.5 text-sm outline-none transition-all focus:border-[#e8871e] focus:ring-2 focus:ring-[#e8871e]/20 dark:focus:border-[#2a7f9e] dark:focus:ring-[#2a7f9e]/20"
+                    className={inputClass}
                   />
                 )}
 
@@ -491,7 +713,7 @@ export function EndpointForm({
                         },
                       })
                     }
-                    className="w-full w-full rounded-xl border bg-background px-4 py-2.5 text-sm outline-none transition-all focus:border-[#e8871e] focus:ring-2 focus:ring-[#e8871e]/20 dark:focus:border-[#2a7f9e] dark:focus:ring-[#2a7f9e]/20"
+                    className={inputClass}
                   />
                 )}
               </div>

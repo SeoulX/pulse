@@ -15,8 +15,29 @@ interface EndpointCardProps {
     uptimePercentage: number;
     isAlerting: boolean;
     consecutiveFailures: number;
+    createdAt: string;
+    lastCheckedAt: string | null;
   };
   onTogglePause?: (id: string, isActive: boolean) => void;
+}
+
+function formatUptime(createdAt: string, lastCheckedAt: string | null): string {
+  if (!lastCheckedAt) return "—";
+  const start = new Date(createdAt).getTime();
+  const last = new Date(lastCheckedAt).getTime();
+  const diffSec = Math.floor((last - start) / 1000);
+  if (diffSec < 0) return "—";
+  if (diffSec < 60) return `${diffSec}s`;
+  const diffMin = Math.floor(diffSec / 60);
+  if (diffMin < 60) return `${diffMin}m`;
+  const diffHr = Math.floor(diffMin / 60);
+  if (diffHr < 24) {
+    const remMin = diffMin % 60;
+    return remMin > 0 ? `${diffHr}h ${remMin}m` : `${diffHr}h`;
+  }
+  const diffDay = Math.floor(diffHr / 24);
+  const remHr = diffHr % 24;
+  return remHr > 0 ? `${diffDay}d ${remHr}h` : `${diffDay}d`;
 }
 
 export function EndpointCard({ endpoint, onTogglePause }: EndpointCardProps) {
@@ -68,8 +89,8 @@ export function EndpointCard({ endpoint, onTogglePause }: EndpointCardProps) {
             ? `${endpoint.lastResponseTime}ms`
             : "—"}
         </span>
-        <span className="text-sm text-muted-foreground">
-          {endpoint.uptimePercentage.toFixed(2)}%
+        <span className="text-sm text-muted-foreground" title={`${endpoint.uptimePercentage.toFixed(2)}% uptime`}>
+          {formatUptime(endpoint.createdAt, endpoint.lastCheckedAt)} up
         </span>
         {endpoint.isAlerting && (
           <span className="text-xs text-red-500">

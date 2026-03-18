@@ -19,7 +19,6 @@ interface EndpointData {
   name: string;
   lastResponseTime: number | null;
   lastStatus: "UP" | "DOWN" | "DEGRADED" | null;
-  uptimePercentage: number;
 }
 
 export function ResponseTrendChart() {
@@ -47,7 +46,6 @@ export function ResponseTrendChart() {
   const chartData = endpoints.slice(0, 8).map((ep) => ({
     name: ep.name.length > 12 ? ep.name.substring(0, 12) + "..." : ep.name,
     response: ep.lastResponseTime ?? 0,
-    uptime: Math.round(ep.uptimePercentage),
   }));
 
   const gridColor = isDark ? "#1e3a4a" : "#e5e7eb";
@@ -91,13 +89,6 @@ export function ResponseTrendChart() {
             dataKey="response"
             name="Response Time (ms)"
             fill={isDark ? "#5ab4c5" : "#f0a830"}
-            radius={[6, 6, 0, 0]}
-            barSize={28}
-          />
-          <Bar
-            dataKey="uptime"
-            name="Uptime %"
-            fill={isDark ? "#0c2d3f" : "#1a1a1a"}
             radius={[6, 6, 0, 0]}
             barSize={28}
           />

@@ -16,6 +16,8 @@ interface EndpointData {
   uptimePercentage: number;
   isAlerting: boolean;
   consecutiveFailures: number;
+  createdAt: string;
+  lastCheckedAt: string | null;
 }
 
 export function EndpointGrid() {
