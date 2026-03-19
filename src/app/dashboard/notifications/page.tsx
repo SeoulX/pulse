@@ -5,7 +5,9 @@ export default function NotificationsPage() {
   return (
     <div className="space-y-6">
       <DashboardHeader title="Notification Log" />
-      <NotificationLog />
+      <div className="rounded-2xl border bg-card p-6 shadow-sm">
+        <NotificationLog />
+      </div>
     </div>
   );
 }

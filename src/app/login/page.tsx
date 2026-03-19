@@ -53,11 +53,12 @@ export default function LoginPage() {
   }
 
   return (
-    <div className="flex min-h-screen items-center justify-center bg-gradient-to-br from-orange-50 via-background to-amber-50/30 dark:from-[#0c2d3f]/50 dark:via-background dark:to-[#164e63]/20">
-      <div className="absolute right-6 top-6">
+    <div className="mesh-gradient flex min-h-screen items-center justify-center bg-gradient-to-br from-orange-50 via-background to-amber-50/30 dark:from-[#0c2d3f]/50 dark:via-background dark:to-[#164e63]/20">
+      <div className="mesh-blob" />
+      <div className="absolute right-6 top-6 z-10">
         <ThemeToggle />
       </div>
-      <div className="w-full max-w-sm space-y-6 rounded-2xl border bg-card p-8 shadow-lg">
+      <div className="relative z-10 w-full max-w-sm space-y-6 rounded-2xl border bg-card p-8 shadow-lg">
         <div className="text-center">
           <div className="mx-auto flex h-14 w-14 items-center justify-center rounded-2xl bg-[#1a1a1a] shadow-md dark:bg-[#164e63]">
             <Activity className="h-7 w-7 text-[#f0a830] dark:text-[#5ab4c5]" />

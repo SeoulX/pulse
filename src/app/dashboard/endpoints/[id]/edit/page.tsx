@@ -21,7 +21,9 @@ export default function EditEndpointPage() {
   return (
     <div className="space-y-6">
       <DashboardHeader title={`Edit: ${endpoint.name}`} />
-      <EndpointForm mode="edit" endpointId={id} initialData={endpoint} />
+      <div className="rounded-2xl border bg-card p-6 shadow-sm">
+        <EndpointForm mode="edit" endpointId={id} initialData={endpoint} />
+      </div>
     </div>
   );
 }

@@ -150,15 +150,15 @@ export default function AnalyticsPage() {
             about your API health.
           </p>
           <p className="mt-1 text-xs text-muted-foreground">
-            Requires ANTHROPIC_API_KEY environment variable
+            Requires LLM_URL environment variable
           </p>
         </div>
       )}
 
       {data && (
-        <div className="space-y-6">
+        <div className="rounded-2xl border bg-card p-6 shadow-sm space-y-6">
           {/* Score + Summary */}
-          <div className="flex items-start gap-6 rounded-2xl border bg-card p-6 shadow-sm">
+          <div className="flex items-start gap-6">
             {data.analysis.score != null && (
               <ScoreRing score={data.analysis.score} />
             )}
@@ -183,7 +183,7 @@ export default function AnalyticsPage() {
                 return (
                   <div
                     key={i}
-                    className={`rounded-2xl border p-4 ${insightColors[insight.type] || insightColors.info}`}
+                    className={`rounded-xl border p-4 ${insightColors[insight.type] || insightColors.info}`}
                   >
                     <div className="flex items-start gap-3">
                       <Icon className="mt-0.5 h-5 w-5 shrink-0" />
@@ -202,12 +202,12 @@ export default function AnalyticsPage() {
 
           {/* Recommendations */}
           {data.analysis.recommendations.length > 0 && (
-            <div className="rounded-2xl border bg-card p-6 shadow-sm">
+            <div className="space-y-3">
               <h2 className="text-lg font-semibold">Recommendations</h2>
-              <ul className="mt-3 space-y-2">
+              <ul className="space-y-2">
                 {data.analysis.recommendations.map((rec, i) => (
                   <li key={i} className="flex items-start gap-2 text-sm">
-                    <span className="mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full bg-[#e8871e]" />
+                    <span className="mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full bg-[#e8871e] dark:bg-[#5ab4c5]" />
                     {rec}
                   </li>
                 ))}

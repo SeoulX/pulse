@@ -100,7 +100,9 @@ export default function UsersPage() {
         </form>
       )}
 
-      <UserTable />
+      <div className="rounded-2xl border bg-card p-6 shadow-sm">
+        <UserTable />
+      </div>
     </div>
   );
 }

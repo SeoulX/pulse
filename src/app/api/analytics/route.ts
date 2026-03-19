@@ -1,18 +1,50 @@
 import { NextRequest } from "next/server";
-import Anthropic from "@anthropic-ai/sdk";
 import { connectDB } from "@/lib/mongodb";
+
+export const maxDuration = 60;
 import Endpoint from "@/lib/models/endpoint";
 import CheckResult from "@/lib/models/check-result";
 import { success, error } from "@/lib/helpers/api-response";
 import { requireAuth } from "@/lib/helpers/auth-guard";
 
+async function callLLM(prompt: string): Promise<string> {
+  const llmUrl = process.env.LLM_URL;
+  const llmKey = process.env.LLM_KEY;
+  const llmModel = process.env.LLM_MODEL || "qwen2.5:3b";
+
+  if (!llmUrl) {
+    throw new Error("LLM_URL not configured");
+  }
+
+  const res = await fetch(`${llmUrl.replace(/\/$/, "")}/api/chat`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      ...(llmKey ? { Authorization: `Bearer ${llmKey}` } : {}),
+    },
+    body: JSON.stringify({
+      model: llmModel,
+      messages: [{ role: "user", content: prompt }],
+      stream: false,
+    }),
+  });
+
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`LLM request failed (${res.status}): ${text}`);
+  }
+
+  const data = await res.json();
+  return data.message?.content || "";
+}
+
 export async function GET(req: NextRequest) {
   try {
     await requireAuth();
 
-    const apiKey = process.env.ANTHROPIC_API_KEY;
-    if (!apiKey) {
-      return error("ANTHROPIC_API_KEY not configured", 501);
+    const llmUrl = process.env.LLM_URL;
+    if (!llmUrl) {
+      return error("LLM_URL not configured. Set LLM_URL, LLM_KEY, and LLM_MODEL in environment variables.", 501);
     }
 
     await connectDB();
@@ -68,20 +100,12 @@ export async function GET(req: NextRequest) {
       })
     );
 
-    const client = new Anthropic({ apiKey });
-
-    const message = await client.messages.create({
-      model: "claude-sonnet-4-20250514",
-      max_tokens: 1500,
-      messages: [
-        {
-          role: "user",
-          content: `You are an API reliability engineer analyzing health check data from a monitoring system. Analyze the following endpoint data and provide actionable insights.
+    const prompt = `You are an API reliability engineer analyzing health check data from a monitoring system. Analyze the following endpoint data and provide actionable insights.
 
 DATA:
 ${JSON.stringify(endpointData, null, 2)}
 
-Provide your analysis in this exact JSON format (no markdown, just raw JSON):
+Provide your analysis in this exact JSON format (no markdown, no code fences, just raw JSON):
 {
   "summary": "One paragraph overall health summary",
   "score": <0-100 health score>,
@@ -102,24 +126,25 @@ Focus on:
 - Performance optimization suggestions
 - Any endpoints with concerning error patterns
 
-Be specific with numbers. If there are no issues, say so.`,
-        },
-      ],
-    });
+Be specific with numbers. If there are no issues, say so. Return ONLY the JSON object, nothing else.`;
 
-    const text =
-      message.content[0].type === "text" ? message.content[0].text : "";
+    const text = await callLLM(prompt);
 
-    // Parse the AI response
+    // Try to extract JSON from response (handle markdown fences)
+    let jsonStr = text.trim();
+    const fenceMatch = jsonStr.match(/```(?:json)?\s*([\s\S]*?)```/);
+    if (fenceMatch) {
+      jsonStr = fenceMatch[1].trim();
+    }
+
     try {
-      const analysis = JSON.parse(text);
+      const analysis = JSON.parse(jsonStr);
       return success({
         analysis,
         endpointCount: endpoints.length,
         generatedAt: new Date().toISOString(),
       });
     } catch {
-      // If AI didn't return valid JSON, wrap it
       return success({
         analysis: {
           summary: text,
