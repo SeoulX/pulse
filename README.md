@@ -33,12 +33,12 @@ graph TB
     end
 
     subgraph Vercel["Vercel (Serverless)"]
-        API[API Routes<br/>/api/*]
+        API["API Routes<br/>/api/*"]
         MW[Middleware<br/>Auth Protection]
-        Cron[/api/cron/check]
-        Trigger[/api/cron/trigger]
-        Discover[/api/discover]
-        Analytics[/api/analytics]
+        Cron["Cron Check"]
+        Trigger["Cron Trigger"]
+        Discover["API Discovery"]
+        Analytics["Analytics"]
     end
 
     subgraph External["External Services"]
@@ -119,15 +119,15 @@ sequenceDiagram
 ```mermaid
 flowchart TD
     A[Request] --> B{Layer 1:<br/>Middleware}
-    B -->|No session| Z[Redirect /login]
+    B -->|No session| Z["Redirect /login"]
     B -->|Valid session| C{Layer 2:<br/>Server Layout}
-    C -->|auth() fails| Z
-    C -->|auth() passes| D{Layer 3:<br/>SessionGuard}
+    C -->|"auth() fails"| Z
+    C -->|"auth() passes"| D{Layer 3:<br/>SessionGuard}
     D -->|Session expired| Z
     D -->|Valid| E[Dashboard Rendered]
 
     F[API Request] --> G{Middleware<br/>Route Match?}
-    G -->|Public route| H[Allow<br/>/api/health, /api/auth/*]
+    G -->|Public route| H["Allow: /api/health, /api/auth/*"]
     G -->|Protected| I{Valid JWT?}
     I -->|No| J[401 Unauthorized]
     I -->|Yes| K{requireAdmin?}
@@ -143,8 +143,8 @@ flowchart LR
     B -->|projectId| C[useFilteredKey Hook]
     C -->|appends ?projectId=X| D[SWR Key]
 
-    D --> E[/api/endpoints?projectId=X]
-    D --> F[/api/stats?projectId=X]
+    D --> E["/api/endpoints?projectId=X"]
+    D --> F["/api/stats?projectId=X"]
 
     E --> G[EndpointGrid]
     F --> H[StatsCards]
