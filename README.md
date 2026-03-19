@@ -45,6 +45,7 @@ graph TB
         Mongo[(MongoDB Atlas<br/>Free M0)]
         CronJob[cron-job.org<br/>Every 1 min]
         LLM[Ollama LLM<br/>Self-hosted]
+        Target[Target APIs]
     end
 
     subgraph Notifications["Notification Channels"]
@@ -62,7 +63,7 @@ graph TB
     Cron --> Mongo
     Trigger --> Mongo
     API --> Mongo
-    Discover -->|fetches OpenAPI specs| External
+    Discover -->|fetches OpenAPI specs| Target
     Analytics -->|/api/chat| LLM
 
     Cron --> Email
@@ -84,7 +85,7 @@ sequenceDiagram
     participant Notif as Notification Service
 
     Cron->>API: GET (Bearer CRON_SECRET)
-    API->>DB: Find active endpoints where<br/>lastCheckedAt + interval <= now
+    API->>DB: Find active endpoints due for check
     DB-->>API: Due endpoints list
 
     loop Promise.allSettled (parallel)
@@ -96,7 +97,7 @@ sequenceDiagram
         API->>Notif: processNotifications(endpoint, result)
     end
 
-    alt consecutiveFailures >= threshold
+    alt consecutiveFailures at or above threshold
         Notif->>Notif: Rate limit check (1 per 5 min)
         Notif-->>DB: Log notification
         par Send alerts
@@ -184,12 +185,12 @@ sequenceDiagram
 stateDiagram-v2
     [*] --> Monitoring
 
-    Monitoring --> AlertTriggered: consecutiveFailures >= threshold
+    Monitoring --> AlertTriggered: failures hit threshold
     Monitoring --> Monitoring: status = UP (reset failures)
 
     AlertTriggered --> RateLimitCheck: Check lastAlertedAt
-    RateLimitCheck --> SendAlert: > 5 min since last alert
-    RateLimitCheck --> Monitoring: < 5 min (skip)
+    RateLimitCheck --> SendAlert: 5+ min since last alert
+    RateLimitCheck --> Monitoring: under 5 min, skip
 
     SendAlert --> Alerting: Set isAlerting = true
     Alerting --> Recovery: Status returns to UP
