@@ -27,6 +27,11 @@ class Settings(BaseSettings):
 
     CORS_ORIGINS: str = "http://localhost:3000"
 
+    BITBUCKET_WORKSPACE: str = "metawhale"
+    BITBUCKET_USER: str = ""
+    BITBUCKET_APP_PASSWORD: str = ""
+    JENKINS_WEBHOOK_URL: str = "https://jenkins.media-meter.in/generic-webhook-trigger/invoke?token=bitbucket-webhook"
+
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"

@@ -19,6 +19,7 @@ from api.handlers.cron import router as cron_router
 from api.handlers.discover import router as discover_router
 from api.handlers.export import router as export_router
 from api.handlers.health import router as health_router
+from api.handlers.deployments import router as deployments_router
 
 
 @asynccontextmanager
@@ -59,3 +60,4 @@ app.include_router(analytics_router, prefix=prefix)
 app.include_router(cron_router, prefix=prefix)
 app.include_router(discover_router, prefix=prefix)
 app.include_router(export_router, prefix=prefix)
+app.include_router(deployments_router, prefix=prefix)

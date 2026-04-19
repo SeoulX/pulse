@@ -16,10 +16,11 @@ async def init_db():
     from models.endpoint import Endpoint
     from models.check_result import CheckResult
     from models.notification import Notification
+    from models.deployment import DeploymentRequest
 
     await init_beanie(
         database=db,
-        document_models=[User, Project, Endpoint, CheckResult, Notification],
+        document_models=[User, Project, Endpoint, CheckResult, Notification, DeploymentRequest],
     )
 
 

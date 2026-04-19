@@ -12,6 +12,7 @@ import {
   Activity,
   Brain,
   FolderOpen,
+  Rocket,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 
@@ -21,6 +22,7 @@ const navItems = [
   { href: "/dashboard/endpoints/new", label: "Add Endpoint", icon: Plus },
   { href: "/dashboard/notifications", label: "Notifications", icon: Bell },
   { href: "/dashboard/analytics", label: "AI Analytics", icon: Brain },
+  { href: "/dashboard/deployments", label: "Deployments", icon: Rocket },
 ];
 
 const adminItems = [
