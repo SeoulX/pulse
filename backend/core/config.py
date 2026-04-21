@@ -32,6 +32,11 @@ class Settings(BaseSettings):
     BITBUCKET_APP_PASSWORD: str = ""
     JENKINS_WEBHOOK_URL: str = "https://jenkins.media-meter.in/generic-webhook-trigger/invoke?token=bitbucket-webhook"
 
+    # When true (default), approved deployments only log a plan. Flip to false to
+    # actually call add_webhook / delete_tag / push_tag. Phase 1 stops at tags_pushed;
+    # Jenkins callback (phase 2) will advance to completed.
+    PULSE_DRY_RUN: bool = True
+
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"

@@ -5,27 +5,47 @@ import httpx
 from core.config import settings
 
 
-def parse_repo_slug(repo_url: str) -> str:
-    """Extract repo slug from a Bitbucket URL.
+ALLOWED_WORKSPACE = "metawhale"
+BOOTSTRAP_TAGS = ("v0.0.0-alpha", "v0.0.0")
+_RELEASE_TAG_RE = re.compile(r"^v(\d+)\.(\d+)\.(\d+)(?:[.-].*)?$")
 
-    Supports:
+
+def parse_repo_slug(repo_url: str) -> str:
+    """Extract repo slug from a Bitbucket URL. Rejects non-metawhale workspaces.
+
+    Accepts:
       - https://bitbucket.org/metawhale/my_repo
       - git@bitbucket.org:metawhale/my_repo.git
       - metawhale/my_repo
-      - my_repo
+      - my_repo (workspace implied as metawhale)
     """
-    # SSH format
-    m = re.search(r"bitbucket\.org[:/][\w-]+/([\w._-]+?)(?:\.git)?$", repo_url)
+    url = repo_url.strip()
+
+    # URL with workspace (https or SSH)
+    m = re.search(r"bitbucket\.org[:/]([\w-]+)/([\w._-]+?)(?:\.git)?/?$", url)
     if m:
-        return m.group(1)
-    # Workspace/repo format
-    m = re.match(r"^[\w-]+/([\w._-]+)$", repo_url.strip())
+        workspace, slug = m.group(1), m.group(2)
+        if workspace != ALLOWED_WORKSPACE:
+            raise ValueError(
+                f"Only the '{ALLOWED_WORKSPACE}' workspace is allowed (got '{workspace}')"
+            )
+        return slug
+
+    # workspace/repo
+    m = re.match(r"^([\w-]+)/([\w._-]+)$", url)
     if m:
-        return m.group(1)
-    # Bare slug
-    m = re.match(r"^[\w._-]+$", repo_url.strip())
+        workspace, slug = m.group(1), m.group(2)
+        if workspace != ALLOWED_WORKSPACE:
+            raise ValueError(
+                f"Only the '{ALLOWED_WORKSPACE}' workspace is allowed (got '{workspace}')"
+            )
+        return slug
+
+    # Bare slug — assume metawhale
+    m = re.match(r"^[\w._-]+$", url)
     if m:
-        return repo_url.strip()
+        return url
+
     raise ValueError(f"Cannot parse repo slug from: {repo_url}")
 
 
@@ -87,3 +107,40 @@ async def push_tag(repo_slug: str, tag_name: str) -> dict:
         )
         resp.raise_for_status()
         return {"created": True, "tag": tag_name}
+
+
+async def delete_tag(repo_slug: str, tag_name: str) -> dict:
+    """Delete a tag. Returns {'deleted': True} on success or if already absent."""
+    async with httpx.AsyncClient(auth=_auth(), timeout=15) as client:
+        resp = await client.delete(_api(f"{repo_slug}/refs/tags/{tag_name}"))
+        if resp.status_code in (200, 204):
+            return {"deleted": True, "tag": tag_name}
+        if resp.status_code == 404:
+            return {"deleted": False, "tag": tag_name, "reason": "not found"}
+        resp.raise_for_status()
+        return {"deleted": False, "tag": tag_name}
+
+
+async def list_tags(repo_slug: str) -> list[str]:
+    """List all tags on a repo. Returns [] on error so callers can treat as 'no info'."""
+    try:
+        async with httpx.AsyncClient(auth=_auth(), timeout=15) as client:
+            resp = await client.get(_api(f"{repo_slug}/refs/tags?pagelen=100"))
+            resp.raise_for_status()
+            return [t["name"] for t in resp.json().get("values", [])]
+    except Exception:
+        return []
+
+
+def classify_tags(existing: list[str]) -> dict:
+    """Split tag list into bootstrap (ours) and release (real vX.Y.Z) categories."""
+    existing_set = set(existing)
+    bootstrap_present = sorted(t for t in BOOTSTRAP_TAGS if t in existing_set)
+    release_present = sorted(
+        t for t in existing
+        if t not in BOOTSTRAP_TAGS and _RELEASE_TAG_RE.match(t)
+    )
+    return {
+        "bootstrap": bootstrap_present,
+        "release": release_present,
+    }

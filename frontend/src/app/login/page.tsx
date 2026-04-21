@@ -1,8 +1,9 @@
 "use client";
 
 import { useState } from "react";
+import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { Activity } from "lucide-react";
+import { Activity, Rocket } from "lucide-react";
 import { ThemeToggle } from "@/components/theme-toggle";
 import { useAuth } from "@/components/auth-context";
 
@@ -103,6 +104,26 @@ export default function LoginPage() {
             ? "Already have an account? Log in"
             : "First time? Create an account"}
         </button>
+
+        <div className="relative">
+          <div className="absolute inset-0 flex items-center">
+            <span className="w-full border-t" />
+          </div>
+          <div className="relative flex justify-center text-xs uppercase">
+            <span className="bg-card px-2 text-muted-foreground">or</span>
+          </div>
+        </div>
+
+        <Link
+          href="/deploy"
+          className="flex w-full items-center justify-center gap-2 rounded-xl border border-[#e8871e] bg-[#e8871e]/10 px-4 py-2.5 text-sm font-medium text-[#e8871e] transition-colors hover:bg-[#e8871e]/20 dark:border-[#2a7f9e] dark:bg-[#2a7f9e]/10 dark:text-[#5ab4c5] dark:hover:bg-[#2a7f9e]/20"
+        >
+          <Rocket className="h-4 w-4" />
+          Request Deployment
+        </Link>
+        <p className="text-center text-xs text-muted-foreground">
+          No account needed — devs can submit deployment requests directly.
+        </p>
       </div>
     </div>
   );
