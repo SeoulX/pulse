@@ -314,7 +314,14 @@ async def get_jenkins_spec(repo_slug: str, request: Request, tag: str | None = N
             status_code=404,
             detail=f"No approved deployment found for {repo_slug}{scope}",
         )
-    return _build_jenkins_spec(dep)
+    spec = _build_jenkins_spec(dep)
+    # When the build is tag-scoped, narrow environments to just the one this
+    # tag is bootstrapping. Otherwise parallel staging/prod builds would each
+    # generate both env subtrees from the spec, race on git push, and only
+    # one commit message would land.
+    if tag in _TAG_ENV_MAP:
+        spec["environments"] = [_TAG_ENV_MAP[tag]]
+    return spec
 
 
 @router.post("", status_code=201)
