@@ -75,10 +75,10 @@ def _derive_profile(team: str, role: str | None, kind: str) -> str | None:
     if role == "Worker":
         return "worker"
     if role == "Streamlit":
-        # Streamlit shares the api shape (envFrom + svc + ingress) but binds to
-        # 8501 and runs `streamlit run`. Keep "api" until the script grows a
-        # streamlit branch; port + command can be patched manually for now.
-        return "api"
+        # The script's streamlit template pins port 8501, sets
+        # `streamlit run main.py` as the container command, adds
+        # session affinity on the Service, and bumps baseline resources.
+        return "streamlit"
     if role == "Multi-Worker":
         # Multi-worker apps ship a devops/workers.yaml in the repo. The bootstrap
         # script reads it and scaffolds N children (server + streamlit + workers).
