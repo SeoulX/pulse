@@ -10,10 +10,12 @@ const STAGES = [
   { key: "approved", label: "Approved" },
   { key: "webhook", label: "Webhook" },
   { key: "tags", label: "Tags pushed" },
+  { key: "image_built", label: "Image built" },
+  { key: "manifest_pushed", label: "Manifests" },
   { key: "completed", label: "Completed" },
 ] as const;
 
-type StageIndex = 0 | 1 | 2 | 3 | 4;
+type StageIndex = 0 | 1 | 2 | 3 | 4 | 5 | 6;
 
 function stageForStatus(status: string): {
   reached: StageIndex;
@@ -23,9 +25,17 @@ function stageForStatus(status: string): {
   switch (status) {
     case "rejected":
       return { reached: 0, failed: true, failedAt: 1 };
+    case "failed_build":
+      return { reached: 3, failed: true, failedAt: 4 };
+    case "failed_manifest":
+      return { reached: 4, failed: true, failedAt: 5 };
     case "failed":
-      return { reached: 1, failed: true, failedAt: 2 };
+      return { reached: 5, failed: true, failedAt: 6 };
     case "completed":
+      return { reached: 6, failed: false, failedAt: 0 };
+    case "manifest_pushed":
+      return { reached: 5, failed: false, failedAt: 0 };
+    case "image_built":
       return { reached: 4, failed: false, failedAt: 0 };
     case "tags_pushed":
       return { reached: 3, failed: false, failedAt: 0 };
@@ -56,9 +66,15 @@ function statusPill(status: string) {
       "bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-400",
     tags_pushed:
       "bg-indigo-100 text-indigo-700 dark:bg-indigo-900/30 dark:text-indigo-400",
+    image_built:
+      "bg-indigo-100 text-indigo-700 dark:bg-indigo-900/30 dark:text-indigo-400",
+    manifest_pushed:
+      "bg-indigo-100 text-indigo-700 dark:bg-indigo-900/30 dark:text-indigo-400",
     completed:
       "bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400",
     failed: "bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-400",
+    failed_build: "bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-400",
+    failed_manifest: "bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-400",
   };
   return styles[status] ?? "bg-muted text-muted-foreground";
 }
@@ -132,9 +148,12 @@ export function DeploymentProgressCard({ data }: { data: ProgressCardData }) {
             const isFail = failed && i === failedAt;
             const isCurrent =
               !failed && i === reached + 1 && reached + 1 < STAGES.length;
+            const failTooltip = isFail
+              ? data.error || data.rejectionReason || `Failed at ${stage.label}`
+              : undefined;
             return (
               <Fragment key={stage.key}>
-                <div className="flex min-w-0 flex-shrink-0 flex-col items-center gap-1.5">
+                <div className="group relative flex min-w-0 flex-shrink-0 flex-col items-center gap-1.5">
                   <div className="relative flex h-6 w-6 items-center justify-center">
                     {isCurrent && (
                       <span className="absolute inset-0 animate-ping rounded-full bg-[#e8871e]/60 dark:bg-[#2a7f9e]/60" />
@@ -161,6 +180,15 @@ export function DeploymentProgressCard({ data }: { data: ProgressCardData }) {
                       )}
                     </div>
                   </div>
+                  {failTooltip && (
+                    <div
+                      role="tooltip"
+                      className="pointer-events-none absolute -top-2 left-1/2 z-10 w-56 -translate-x-1/2 -translate-y-full rounded-lg border border-red-200 bg-red-50 p-2 text-[11px] leading-snug text-red-700 opacity-0 shadow-md transition-opacity group-hover:opacity-100 dark:border-red-900/50 dark:bg-red-950 dark:text-red-300"
+                    >
+                      <div className="font-semibold">Failure cause</div>
+                      <div className="mt-0.5 break-words">{failTooltip}</div>
+                    </div>
+                  )}
                   <span
                     className={`max-w-[4.5rem] truncate text-center text-[10px] leading-tight ${
                       done || isCurrent || isFail
@@ -226,8 +254,8 @@ export function DeploymentProgress({ submissions, onClear }: Props) {
         <div>
           <h3 className="text-lg font-semibold">Your submissions</h3>
           <p className="text-xs text-muted-foreground">
-            Saved in this browser. Jenkins dispatch is still a dry run — status
-            will update once the pipeline is wired.
+            Saved in this browser. Auto-refreshes every 5s until each
+            deployment reaches a terminal state.
           </p>
         </div>
         <button
