@@ -12,3 +12,4 @@ aiosmtplib==3.0.2
 email-validator==2.2.0
 python-dotenv==1.0.1
 fpdf2==2.8.1
+redis==5.1.1

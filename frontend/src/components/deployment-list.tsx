@@ -47,6 +47,13 @@ const STATUS_STYLES: Record<string, string> = {
     "bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-400",
   tags_pushed:
     "bg-indigo-100 text-indigo-700 dark:bg-indigo-900/30 dark:text-indigo-400",
+  image_built:
+    "bg-indigo-100 text-indigo-700 dark:bg-indigo-900/30 dark:text-indigo-400",
+  manifest_pushed:
+    "bg-indigo-100 text-indigo-700 dark:bg-indigo-900/30 dark:text-indigo-400",
+  failed_build: "bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-400",
+  failed_manifest:
+    "bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-400",
 };
 
 export function DeploymentList() {

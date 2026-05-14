@@ -1,7 +1,7 @@
 "use client";
 
 import { Fragment } from "react";
-import { Check, CircleDashed, Loader2, X, Trash2 } from "lucide-react";
+import { Check, CircleDashed, Loader2, X, Trash2, ExternalLink } from "lucide-react";
 
 import type { SubmittedDeployment } from "@/components/deployment-form";
 
@@ -100,6 +100,9 @@ export interface ProgressCardData {
   environments: string[];
   manifestPath?: string;
   status: string;
+  envStatuses?: Record<string, string>;
+  envErrors?: Record<string, string>;
+  argocdLinks?: Record<string, string>;
   createdAt: string;
   requestedBy?: string;
   approvedBy?: string | null;
@@ -108,8 +111,123 @@ export interface ProgressCardData {
   error?: string | null;
 }
 
+interface EnvTrackerProps {
+  env: string;
+  status: string;
+  error?: string;
+  argocdLink?: string;
+  rejectionReason?: string | null;
+}
+
+function EnvTracker({ env, status, error, argocdLink, rejectionReason }: EnvTrackerProps) {
+  const { reached, failed, failedAt } = stageForStatus(status);
+  return (
+    <div className="space-y-2">
+      <div className="flex items-center justify-between gap-2">
+        <span className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+          {env}
+        </span>
+        <span
+          className={`rounded-lg px-2 py-0.5 text-[10px] font-medium ${statusPill(status)}`}
+        >
+          {status}
+        </span>
+      </div>
+      <div className="flex items-start">
+        {STAGES.map((stage, i) => {
+          const done = i <= reached;
+          const isFail = failed && i === failedAt;
+          const isCurrent =
+            !failed && i === reached + 1 && reached + 1 < STAGES.length;
+          const failTooltip = isFail
+            ? error || rejectionReason || `Failed at ${stage.label}`
+            : undefined;
+          return (
+            <Fragment key={stage.key}>
+              <div className="group relative flex min-w-0 flex-shrink-0 flex-col items-center gap-1.5">
+                <div className="relative flex h-6 w-6 items-center justify-center">
+                  {isCurrent && (
+                    <span className="absolute inset-0 animate-ping rounded-full bg-[#e8871e]/60 dark:bg-[#2a7f9e]/60" />
+                  )}
+                  <div
+                    className={`relative flex h-6 w-6 items-center justify-center rounded-full ${
+                      isFail
+                        ? "bg-red-500 text-white"
+                        : isCurrent
+                          ? "border-2 border-[#e8871e] bg-background text-[#e8871e] dark:border-[#2a7f9e] dark:text-[#5ab4c5]"
+                          : done
+                            ? "bg-[#e8871e] text-white dark:bg-[#2a7f9e]"
+                            : "border border-dashed bg-background text-muted-foreground"
+                    }`}
+                  >
+                    {isFail ? (
+                      <X className="h-3.5 w-3.5" />
+                    ) : isCurrent ? (
+                      <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                    ) : done ? (
+                      <Check className="h-3.5 w-3.5" />
+                    ) : (
+                      <CircleDashed className="h-3.5 w-3.5" />
+                    )}
+                  </div>
+                </div>
+                {failTooltip && (
+                  <div
+                    role="tooltip"
+                    className="pointer-events-none absolute -top-2 left-1/2 z-10 w-56 -translate-x-1/2 -translate-y-full rounded-lg border border-red-200 bg-red-50 p-2 text-[11px] leading-snug text-red-700 opacity-0 shadow-md transition-opacity group-hover:opacity-100 dark:border-red-900/50 dark:bg-red-950 dark:text-red-300"
+                  >
+                    <div className="font-semibold">Failure cause</div>
+                    <div className="mt-0.5 break-words">{failTooltip}</div>
+                  </div>
+                )}
+                <span
+                  className={`max-w-[4.5rem] truncate text-center text-[10px] leading-tight ${
+                    done || isCurrent || isFail
+                      ? "font-medium text-foreground"
+                      : "text-muted-foreground"
+                  }`}
+                >
+                  {stage.label}
+                </span>
+              </div>
+              {i < STAGES.length - 1 && (
+                <div
+                  className={`mx-1 mt-3 h-px flex-1 ${
+                    done && i < reached
+                      ? "bg-[#e8871e] dark:bg-[#2a7f9e]"
+                      : "bg-border"
+                  }`}
+                />
+              )}
+            </Fragment>
+          );
+        })}
+      </div>
+      {status === "completed" && argocdLink && (
+        <a
+          href={argocdLink}
+          target="_blank"
+          rel="noreferrer"
+          className="inline-flex items-center gap-1 text-[11px] font-medium text-[#e8871e] hover:underline dark:text-[#5ab4c5]"
+        >
+          <ExternalLink className="h-3 w-3" />
+          Open in ArgoCD
+        </a>
+      )}
+      {error && !argocdLink && (
+        <p className="text-[11px] text-red-500">{error}</p>
+      )}
+    </div>
+  );
+}
+
 export function DeploymentProgressCard({ data }: { data: ProgressCardData }) {
-  const { reached, failed, failedAt } = stageForStatus(data.status);
+  // Render one tracker per env whenever the request targets more than one,
+  // even before per-env callbacks land — each tracker is seeded from the
+  // aggregate status and diverges as env-tagged callbacks arrive.
+  const envStatuses = data.envStatuses ?? {};
+  const renderPerEnv = data.environments.length > 1;
+
   return (
     <div className="rounded-xl border bg-background p-4 transition-colors">
       <div className="flex flex-wrap items-center gap-2">
@@ -141,77 +259,26 @@ export function DeploymentProgressCard({ data }: { data: ProgressCardData }) {
         </div>
       )}
 
-      <div className="mt-4">
-        <div className="flex items-start">
-          {STAGES.map((stage, i) => {
-            const done = i <= reached;
-            const isFail = failed && i === failedAt;
-            const isCurrent =
-              !failed && i === reached + 1 && reached + 1 < STAGES.length;
-            const failTooltip = isFail
-              ? data.error || data.rejectionReason || `Failed at ${stage.label}`
-              : undefined;
-            return (
-              <Fragment key={stage.key}>
-                <div className="group relative flex min-w-0 flex-shrink-0 flex-col items-center gap-1.5">
-                  <div className="relative flex h-6 w-6 items-center justify-center">
-                    {isCurrent && (
-                      <span className="absolute inset-0 animate-ping rounded-full bg-[#e8871e]/60 dark:bg-[#2a7f9e]/60" />
-                    )}
-                    <div
-                      className={`relative flex h-6 w-6 items-center justify-center rounded-full ${
-                        isFail
-                          ? "bg-red-500 text-white"
-                          : isCurrent
-                            ? "border-2 border-[#e8871e] bg-background text-[#e8871e] dark:border-[#2a7f9e] dark:text-[#5ab4c5]"
-                            : done
-                              ? "bg-[#e8871e] text-white dark:bg-[#2a7f9e]"
-                              : "border border-dashed bg-background text-muted-foreground"
-                      }`}
-                    >
-                      {isFail ? (
-                        <X className="h-3.5 w-3.5" />
-                      ) : isCurrent ? (
-                        <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                      ) : done ? (
-                        <Check className="h-3.5 w-3.5" />
-                      ) : (
-                        <CircleDashed className="h-3.5 w-3.5" />
-                      )}
-                    </div>
-                  </div>
-                  {failTooltip && (
-                    <div
-                      role="tooltip"
-                      className="pointer-events-none absolute -top-2 left-1/2 z-10 w-56 -translate-x-1/2 -translate-y-full rounded-lg border border-red-200 bg-red-50 p-2 text-[11px] leading-snug text-red-700 opacity-0 shadow-md transition-opacity group-hover:opacity-100 dark:border-red-900/50 dark:bg-red-950 dark:text-red-300"
-                    >
-                      <div className="font-semibold">Failure cause</div>
-                      <div className="mt-0.5 break-words">{failTooltip}</div>
-                    </div>
-                  )}
-                  <span
-                    className={`max-w-[4.5rem] truncate text-center text-[10px] leading-tight ${
-                      done || isCurrent || isFail
-                        ? "font-medium text-foreground"
-                        : "text-muted-foreground"
-                    }`}
-                  >
-                    {stage.label}
-                  </span>
-                </div>
-                {i < STAGES.length - 1 && (
-                  <div
-                    className={`mx-1 mt-3 h-px flex-1 ${
-                      done && i < reached
-                        ? "bg-[#e8871e] dark:bg-[#2a7f9e]"
-                        : "bg-border"
-                    }`}
-                  />
-                )}
-              </Fragment>
-            );
-          })}
-        </div>
+      <div className="mt-4 space-y-5">
+        {renderPerEnv ? (
+          data.environments.map((env) => (
+            <EnvTracker
+              key={env}
+              env={env}
+              status={envStatuses[env] ?? data.status}
+              error={data.envErrors?.[env] ?? undefined}
+              argocdLink={data.argocdLinks?.[env]}
+              rejectionReason={data.rejectionReason}
+            />
+          ))
+        ) : (
+          <EnvTracker
+            env={data.environments.join(" + ") || "deployment"}
+            status={data.status}
+            error={data.error ?? undefined}
+            rejectionReason={data.rejectionReason}
+          />
+        )}
       </div>
 
       {data.status === "rejected" && (
@@ -220,10 +287,6 @@ export function DeploymentProgressCard({ data }: { data: ProgressCardData }) {
           {data.approvedBy ? <> by {data.approvedBy}</> : null}
           {data.rejectionReason ? <> — {data.rejectionReason}</> : null}
         </div>
-      )}
-
-      {data.error && data.status !== "rejected" && (
-        <p className="mt-3 text-xs text-red-500">{data.error}</p>
       )}
 
       <div className="mt-3 flex items-center justify-between text-xs text-muted-foreground">

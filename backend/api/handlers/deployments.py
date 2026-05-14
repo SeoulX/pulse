@@ -30,26 +30,37 @@ REGISTRY = "zen0hub"
 _CLUSTER_TOLERATIONS = {
     "kl-1": [{"key": "proj", "operator": "Equal", "value": "salina", "effect": "NoSchedule"}],
     "kl-2": [{"key": "dept", "operator": "Equal", "value": "dc", "effect": "NoSchedule"}],
-    "net3": [],
+}
+
+# Per-cluster ArgoCD UI base. kl-1 has a public ingress; kl-2 ArgoCD is only
+# reachable on the cluster LAN via NodePort. UI links are computed here so a
+# central change doesn't require touching every frontend that renders them.
+_ARGOCD_BASE = {
+    "kl-1": "https://argocd-kl.media-meter.in",
+    "kl-2": "http://192.168.12.16:30443",
 }
 
 
+def _argocd_links(cluster: str, app: str, environments: list[str]) -> dict[str, str]:
+    base = _ARGOCD_BASE.get(cluster)
+    if not base:
+        return {}
+    return {
+        env: f"{base}/applications/argocd/{app}-{env}" for env in environments
+    }
+
+
 def _host_aliases_for(cluster: str) -> list[dict]:
-    """Mongo + arbiter hostAliases per cluster network.
-    kl-1 / kl-2 share the 192.168.10.0/24 network; net3 is on 192.168.11.0/24.
-    Mongo replica set members live at .10–.13, arbiter at .33."""
-    if cluster in ("kl-1", "kl-2"):
-        net = "10"
-    elif cluster == "net3":
-        net = "11"
-    else:
+    """Mongo + arbiter hostAliases per cluster. kl-1 and kl-2 share the
+    192.168.10.0/24 mongo network — replica set members at .10–.13, arbiter at .33."""
+    if cluster not in ("kl-1", "kl-2"):
         return []
     return [
-        {"ip": f"192.168.{net}.10", "hostnames": ["mongodb1"]},
-        {"ip": f"192.168.{net}.11", "hostnames": ["mongodb2"]},
-        {"ip": f"192.168.{net}.12", "hostnames": ["mongodb3"]},
-        {"ip": f"192.168.{net}.13", "hostnames": ["mongodb4"]},
-        {"ip": f"192.168.{net}.33", "hostnames": ["arbiter"]},
+        {"ip": "192.168.10.10", "hostnames": ["mongodb1"]},
+        {"ip": "192.168.10.11", "hostnames": ["mongodb2"]},
+        {"ip": "192.168.10.12", "hostnames": ["mongodb3"]},
+        {"ip": "192.168.10.13", "hostnames": ["mongodb4"]},
+        {"ip": "192.168.10.33", "hostnames": ["arbiter"]},
     ]
 
 
@@ -63,15 +74,18 @@ _ROLE_DEFAULT_ARGS: dict[str, dict[str, str]] = {
 }
 
 
-def _derive_profile(team: str, role: str | None, kind: str) -> str | None:
-    """Map (team, role, kind) → generate-manifests.sh profile.
-    Profile only meaningful for Deployment kind; other kinds keep the legacy path."""
+def _derive_profile(
+    team: str, role: str | None, kind: str, with_worker: bool = False
+) -> str | None:
+    """Map (team, role, kind, with_worker) → generate-manifests.sh profile."""
+    # DC/ML ScaledJob is always multi-worker — devops/workers.yaml in the repo
+    # is the source of truth; the bootstrap script scaffolds N children from it.
+    if team == "DC/ML" and kind == "ScaledJob":
+        return "multi-worker"
     if kind != "Deployment":
         return None
     if team == "Frontend" or role == "UI":
         return "ui"
-    if role == "API+Worker":
-        return "api-worker"
     if role == "Worker":
         return "worker"
     if role == "Streamlit":
@@ -79,10 +93,8 @@ def _derive_profile(team: str, role: str | None, kind: str) -> str | None:
         # `streamlit run main.py` as the container command, adds
         # session affinity on the Service, and bumps baseline resources.
         return "streamlit"
-    if role == "Multi-Worker":
-        # Multi-worker apps ship a devops/workers.yaml in the repo. The bootstrap
-        # script reads it and scaffolds N children (server + streamlit + workers).
-        return "multi-worker"
+    if role == "API" and with_worker:
+        return "api-worker"
     return "api"
 
 
@@ -90,7 +102,7 @@ def _build_jenkins_spec(d: DeploymentRequest) -> dict:
     """Construct the spec.json content Jenkins will read from Redis."""
     image = f"{REGISTRY}/{d.repo_slug}"
     app = d.repo_slug.replace("_", "-")
-    profile = _derive_profile(d.team, d.role, d.workload_kind)
+    profile = _derive_profile(d.team, d.role, d.workload_kind, d.with_worker)
     spec: dict = {
         "app": app,
         "cluster": d.cluster,
@@ -104,6 +116,7 @@ def _build_jenkins_spec(d: DeploymentRequest) -> dict:
     }
     if profile:
         spec["profile"] = profile
+    spec["domainZone"] = d.domain_zone
     if d.domain:
         spec["domain"] = d.domain
     # Container args precedence: explicit override (rare; admin/API only) wins,
@@ -138,12 +151,13 @@ def _build_jenkins_spec(d: DeploymentRequest) -> dict:
 
 
 def _manifest_path(d: DeploymentRequest) -> str:
-    if d.team in ("DC", "ML"):
+    if d.team == "DC/ML":
         return f"{d.cluster}/data-collection/{d.repo_slug}/"
     return f"{d.cluster}/{d.repo_slug}/"
 
 
 def serialize(d: DeploymentRequest) -> dict:
+    app = d.repo_slug.replace("_", "-")
     return {
         "_id": str(d.id),
         "repoSlug": d.repo_slug,
@@ -151,16 +165,21 @@ def serialize(d: DeploymentRequest) -> dict:
         "team": d.team,
         "workloadKind": d.workload_kind,
         "role": d.role,
+        "withWorker": d.with_worker,
         "cluster": d.cluster,
         "environments": d.environments,
         "envVars": d.env_vars,
         "domain": d.domain,
+        "domainZone": d.domain_zone,
         "port": d.port,
         "args": d.args,
         "hpa": d.hpa,
         "manifestPath": _manifest_path(d),
         "status": d.status,
         "error": d.error,
+        "envStatuses": d.env_statuses or {},
+        "envErrors": d.env_errors or {},
+        "argocdLinks": _argocd_links(d.cluster, app, d.environments),
         "requestedBy": d.requested_by,
         "approvedBy": d.approved_by,
         "approvedAt": d.approved_at.isoformat() if d.approved_at else None,
@@ -173,21 +192,27 @@ def serialize(d: DeploymentRequest) -> dict:
 
 def serialize_public(d: DeploymentRequest) -> dict:
     """Public-safe view. No requester email, no _id."""
+    app = d.repo_slug.replace("_", "-")
     return {
         "repoSlug": d.repo_slug,
         "team": d.team,
         "workloadKind": d.workload_kind,
         "role": d.role,
+        "withWorker": d.with_worker,
         "cluster": d.cluster,
         "environments": d.environments,
         "envVars": d.env_vars,
         "domain": d.domain,
+        "domainZone": d.domain_zone,
         "port": d.port,
         "args": d.args,
         "hpa": d.hpa,
         "manifestPath": _manifest_path(d),
         "status": d.status,
         "error": d.error,
+        "envStatuses": d.env_statuses or {},
+        "envErrors": d.env_errors or {},
+        "argocdLinks": _argocd_links(d.cluster, app, d.environments),
         "rejectionReason": d.rejection_reason,
         "approvedAt": d.approved_at.isoformat() if d.approved_at else None,
         "trackToken": d.track_token,
@@ -338,10 +363,12 @@ async def create_deployment(body: CreateDeploymentRequest):
         team=body.team,
         workload_kind=body.workload_kind,
         role=body.role,
+        with_worker=body.with_worker,
         cluster=body.cluster,
         environments=body.environments,
         env_vars=body.env_vars,
         domain=body.domain,
+        domain_zone=body.domain_zone,
         port=body.port,
         args=body.args,
         hpa=body.hpa,
@@ -485,44 +512,123 @@ async def reject_deployment(
     return serialize(dep)
 
 
-# Terminal states: callbacks for repos in these states are ignored.
-_TERMINAL_STATUSES = {
-    "completed",
-    "failed",
-    "failed_build",
-    "failed_manifest",
-    "rejected",
-    "dry_run",
+# Failure phases. Per-env, these are terminal — once an env hits one of these,
+# further callbacks for that env are ignored. The success-terminal "completed"
+# is per-env too, so a completed prod no longer swallows a failed staging.
+_FAILURE_STATUSES = {"failed", "failed_build", "failed_manifest", "rejected"}
+_PER_ENV_TERMINAL = _FAILURE_STATUSES | {"completed"}
+
+# Phase ordering for the worst-of aggregate. Failures rank highest so any env
+# failure surfaces on the aggregate pill. completed ranks lowest among terminals
+# so it only wins when every env is also completed.
+_PHASE_RANK: dict[str, int] = {
+    "pending_approval": 0,
+    "pending":          0,
+    "approved":         1,
+    "dry_run":          1,
+    "webhook_added":    2,
+    "tags_pushed":      3,
+    "image_built":      4,
+    "manifest_pushed":  5,
+    "completed":        6,
+    # Failures rank highest — worst-of picks them over any in-flight env.
+    "failed":           10,
+    "failed_build":     11,
+    "failed_manifest":  12,
+    "rejected":         13,
 }
+
+
+def _aggregate_status(envs: list[str], env_statuses: dict[str, str], fallback: str) -> str:
+    """Worst-of across env_statuses. Failures > non-terminal > completed.
+
+    `fallback` is the legacy pre-callback status (pending_approval, approved,
+    webhook_added, tags_pushed) — used when no env has reported yet."""
+    reported = [env_statuses.get(e) for e in envs if env_statuses.get(e)]
+    if not reported:
+        return fallback
+    # If any env failed, that failure wins.
+    failures = [s for s in reported if s in _FAILURE_STATUSES]
+    if failures:
+        return max(failures, key=lambda s: _PHASE_RANK.get(s, 0))
+    # Completed only wins if EVERY requested env is completed.
+    if all(s == "completed" for s in reported) and len(reported) == len(envs):
+        return "completed"
+    # Otherwise return the least-advanced non-terminal (the lagging env).
+    return min(reported, key=lambda s: _PHASE_RANK.get(s, 0))
 
 
 @router.post("/callback/{repo_slug}")
 async def pipeline_callback(repo_slug: str, body: PipelineCallback):
-    """Jenkins -> Pulse callback. Advances the most recent non-terminal
-    deployment for this repo slug to the reported phase."""
-    dep = await DeploymentRequest.find_one(
-        DeploymentRequest.repo_slug == repo_slug,
-        {"status": {"$nin": list(_TERMINAL_STATUSES)}},
-        sort=[("createdAt", -1)],
-    )
+    """Jenkins -> Pulse callback. Updates per-env status on the most recent
+    deployment for this repo+env, then recomputes the aggregate `status` as
+    worst-of across all requested envs.
+
+    Older callbacks without `env` set still work — they update the aggregate
+    directly (legacy path)."""
+    # Per-env path: scope the lookup to deployments that actually requested
+    # this env, and where THIS env is not yet terminal. That way a completed
+    # production can never swallow a failed_manifest staging callback.
+    if body.env:
+        dep = await DeploymentRequest.find_one(
+            DeploymentRequest.repo_slug == repo_slug,
+            {"environments": body.env},
+            {f"env_statuses.{body.env}": {"$nin": list(_PER_ENV_TERMINAL)}},
+            sort=[("createdAt", -1)],
+        )
+    else:
+        # Legacy: match any non-terminal aggregate.
+        dep = await DeploymentRequest.find_one(
+            DeploymentRequest.repo_slug == repo_slug,
+            {"status": {"$nin": list(_PER_ENV_TERMINAL | {"dry_run"})}},
+            sort=[("createdAt", -1)],
+        )
+
     if not dep:
-        # No active deployment for this repo — common when Jenkins rebuilds
-        # a tag without a Pulse submission (e.g., dev tagged manually).
         print(
             f"[PIPELINE CALLBACK] {repo_slug} status={body.status}"
-            f" — no active deployment to advance",
+            f" env={body.env or '?'} — no active deployment to advance",
             flush=True,
         )
         return {"matched": False, "repoSlug": repo_slug}
 
-    dep.status = body.status
-    if body.status == "failed" and body.error:
-        dep.error = body.error
+    if body.env:
+        # Initialize the dicts (Beanie keeps Pydantic defaults but older docs
+        # may not have them populated).
+        env_statuses = dict(dep.env_statuses or {})
+        env_errors = dict(dep.env_errors or {})
+        env_statuses[body.env] = body.status
+        if body.error and body.status in _FAILURE_STATUSES:
+            env_errors[body.env] = body.error
+        dep.env_statuses = env_statuses
+        dep.env_errors = env_errors
+
+        # Recompute aggregate. Use the pre-callback aggregate as fallback when
+        # this is the first env to report (so the pill doesn't regress from
+        # tags_pushed → pending while waiting on the other env).
+        dep.status = _aggregate_status(
+            dep.environments, env_statuses, fallback=dep.status
+        )
+        # Aggregate error: pick any env error to surface in the legacy `error`
+        # field. UI prefers env_errors per-env when rendering.
+        if env_errors:
+            dep.error = next(iter(env_errors.values()))
+    else:
+        dep.status = body.status
+        if body.status in _FAILURE_STATUSES and body.error:
+            dep.error = body.error
+
     await dep.save()
 
     print(
-        f"[PIPELINE CALLBACK] {repo_slug} → {body.status}"
-        f" (deployment {dep.id})",
+        f"[PIPELINE CALLBACK] {repo_slug} env={body.env or 'legacy'}"
+        f" → {body.status} (aggregate={dep.status}, id={dep.id})",
         flush=True,
     )
-    return {"matched": True, "repoSlug": repo_slug, "deploymentId": str(dep.id), "status": dep.status}
+    return {
+        "matched": True,
+        "repoSlug": repo_slug,
+        "deploymentId": str(dep.id),
+        "status": dep.status,
+        "envStatuses": dep.env_statuses,
+    }

@@ -1,4 +1,7 @@
-export const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+// Empty = same-origin. The Next.js server proxies /api/* to the backend (see
+// next.config.mjs rewrites + PULSE_API_INTERNAL_URL). Set NEXT_PUBLIC_API_URL
+// only if you need to hit a remote backend directly from the browser.
+export const API_URL = process.env.NEXT_PUBLIC_API_URL || "";
 
 export function getToken(): string | null {
   if (typeof window === "undefined") return null;

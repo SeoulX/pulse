@@ -32,6 +32,18 @@ class Settings(BaseSettings):
     BITBUCKET_APP_PASSWORD: str = ""
     JENKINS_WEBHOOK_URL: str = "https://jenkins.media-meter.in/generic-webhook-trigger/invoke?token=bitbucket-webhook"
 
+    # Shared bearer token Jenkins presents when calling GET /api/deployments/spec/<slug>
+    # at bootstrap time. Same secret value lives in the Jenkins JCasC credential
+    # store as `jenkins-shared-secret`. Empty disables the endpoint (returns 503).
+    JENKINS_SHARED_SECRET: str = ""
+
+    # Redis (cluster's redis-stack/redis-kl1-master). Pulse publishes spec.json and
+    # job entries here for Jenkins to consume at bootstrap time.
+    REDIS_HOST: str = "192.168.10.40"
+    REDIS_PORT: int = 31379
+    REDIS_PASSWORD: str = ""
+    REDIS_DB: int = 0
+
     # When true (default), approved deployments only log a plan. Flip to false to
     # actually call add_webhook / delete_tag / push_tag. Phase 1 stops at tags_pushed;
     # Jenkins callback (phase 2) will advance to completed.

@@ -12,10 +12,26 @@ import {
 } from "@/components/deployment-progress";
 
 const POLL_MS = 5000;
-const TERMINAL = new Set(["completed", "failed"]);
+const TERMINAL = new Set([
+  "completed",
+  "failed",
+  "failed_build",
+  "failed_manifest",
+  "rejected",
+]);
 
 interface TrackResponse extends ProgressCardData {
   trackToken: string;
+}
+
+function allEnvsTerminal(json: TrackResponse): boolean {
+  // If we don't have per-env data, fall back to aggregate terminal check.
+  const envStatuses = json.envStatuses ?? {};
+  const envs = json.environments ?? [];
+  if (envs.length === 0 || Object.keys(envStatuses).length === 0) {
+    return TERMINAL.has(json.status);
+  }
+  return envs.every((e) => TERMINAL.has(envStatuses[e] ?? ""));
 }
 
 export default function TrackDeploymentPage() {
@@ -60,7 +76,7 @@ export default function TrackDeploymentPage() {
     const loop = async () => {
       const json = await fetchOnce();
       if (cancelled) return;
-      if (json && !TERMINAL.has(json.status)) {
+      if (json && !allEnvsTerminal(json)) {
         timer = setTimeout(loop, POLL_MS);
       }
     };

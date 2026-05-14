@@ -15,14 +15,16 @@ def parse_repo_slug(repo_url: str) -> str:
 
     Accepts:
       - https://bitbucket.org/metawhale/my_repo
+      - https://bitbucket.org/metawhale/my_repo/src/main/
+      - https://bitbucket.org/metawhale/my_repo/src/main/README.md
       - git@bitbucket.org:metawhale/my_repo.git
       - metawhale/my_repo
       - my_repo (workspace implied as metawhale)
     """
     url = repo_url.strip()
 
-    # URL with workspace (https or SSH)
-    m = re.search(r"bitbucket\.org[:/]([\w-]+)/([\w._-]+?)(?:\.git)?/?$", url)
+    # URL with workspace (https or SSH); tolerates trailing paths like /src/main/
+    m = re.search(r"bitbucket\.org[:/]([\w-]+)/([\w._-]+?)(?:\.git|/|$)", url)
     if m:
         workspace, slug = m.group(1), m.group(2)
         if workspace != ALLOWED_WORKSPACE:
