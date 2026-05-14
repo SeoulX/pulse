@@ -97,13 +97,50 @@ const ENVIRONMENTS = [
   { value: "production", label: "production", tag: "v0.0.0" },
 ] as const;
 
+// All public Route53 hosted zones across both AWS profiles
+// (default + aws-mmi-drian). Synced 2026-05-14 — see
+// manifests-seven-gen-v2/manComm/05-14-26/route53-backup/ for the raw
+// record dump captured before any external-dns writes against these zones.
 const DOMAIN_ZONES = [
   "media-meter.in",
+  "amin-apac.com",
+  "bebot.page",
+  "buboy.ai",
+  "buboy.page",
+  "detour.run",
+  "dividr.app",
+  "downlodr.com",
+  "dyaryo.ai",
+  "essuances.com",
+  "kersiv.ai",
+  "kurii.ai",
+  "lexibean.ai",
+  "m2comms.com",
+  "m2comms.net",
+  "m2online.ph",
   "media-meter.com",
-  "sekond.io",
-  "scoup.app",
-  "salina.app",
+  "media-meter.net",
+  "media-meter.org",
   "metawhale.app",
+  "morfd.ai",
+  "mycelium-learn.com",
+  "rythmosdb.com",
+  "rythmosdb.io",
+  "salin.ai",
+  "salina.app",
+  "salina.chat",
+  "salina.page",
+  "scoup.app",
+  "sekond.io",
+  "seven-gen.com",
+  "seven-gen.net",
+  "skedulosa.app",
+  "talisik.ai",
+  "talisik.com",
+  "temportia.ai",
+  "torni.ai",
+  "twygr.ai",
+  "whizpen.ai",
 ] as const;
 
 type WorkloadKind = (typeof WORKLOAD_KINDS)[number]["value"];
