@@ -33,6 +33,18 @@ function stageForStatus(status: string): {
       return { reached: 5, failed: true, failedAt: 6 };
     case "completed":
       return { reached: 6, failed: false, failedAt: 0 };
+    // New step-by-step "currently doing X" statuses. The Jenkinsfile fires
+    // these at stage START so the UI mirrors Jenkins's stage view: the
+    // matching stage renders with a spinner (isCurrent = reached+1).
+    case "cleaning_up":
+      return { reached: 5, failed: false, failedAt: 0 };
+    case "pushing_manifest":
+      return { reached: 4, failed: false, failedAt: 0 };
+    case "building_image":
+      return { reached: 3, failed: false, failedAt: 0 };
+    // Legacy "stage just finished" statuses. Older Jenkinsfile versions
+    // and pre-existing records use these — render one stage further along
+    // than the in-progress counterparts above.
     case "manifest_pushed":
       return { reached: 5, failed: false, failedAt: 0 };
     case "image_built":
@@ -68,7 +80,13 @@ function statusPill(status: string) {
       "bg-indigo-100 text-indigo-700 dark:bg-indigo-900/30 dark:text-indigo-400",
     image_built:
       "bg-indigo-100 text-indigo-700 dark:bg-indigo-900/30 dark:text-indigo-400",
+    building_image:
+      "bg-indigo-100 text-indigo-700 dark:bg-indigo-900/30 dark:text-indigo-400",
     manifest_pushed:
+      "bg-indigo-100 text-indigo-700 dark:bg-indigo-900/30 dark:text-indigo-400",
+    pushing_manifest:
+      "bg-indigo-100 text-indigo-700 dark:bg-indigo-900/30 dark:text-indigo-400",
+    cleaning_up:
       "bg-indigo-100 text-indigo-700 dark:bg-indigo-900/30 dark:text-indigo-400",
     completed:
       "bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400",
@@ -276,6 +294,12 @@ export function DeploymentProgressCard({ data }: { data: ProgressCardData }) {
             env={data.environments.join(" + ") || "deployment"}
             status={data.status}
             error={data.error ?? undefined}
+            // The ArgoCD link disappeared for single-env (post-SEV) records
+            // because this branch didn't forward argocdLinks. Use the first
+            // env's link — there is only one env in this branch.
+            argocdLink={
+              data.argocdLinks?.[data.environments[0] ?? ""] ?? undefined
+            }
             rejectionReason={data.rejectionReason}
           />
         )}

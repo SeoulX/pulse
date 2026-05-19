@@ -32,6 +32,12 @@ class CreateDeploymentRequest(BaseModel):
     domain: Optional[str] = None
     # Container port. Default 8000 (most APIs). UIs typically 3000, Streamlit 8501.
     port: int = 8000
+    # Whether the workload needs a public ingress + TLS cert. Defaults
+    # depend on role (API/UI/Streamlit → true; Worker/ScaledJob/CronJob
+    # → false) but the form can override either way. Stored unchanged
+    # on the DeploymentRequest; the manifest generator reads
+    # spec.needsIngress at bootstrap time.
+    needs_ingress: Optional[bool] = None
     # Container args per child. Keys: "server", "worker". Empty/missing = image CMD.
     # Tokens split on whitespace by the bootstrap script (one arg per token).
     args: Dict[str, str] = Field(default_factory=dict)
@@ -46,16 +52,35 @@ class RejectDeploymentRequest(BaseModel):
     reason: Optional[str] = None
 
 
-# Jenkins -> Pulse pipeline callback. Reports the phase the pipeline just
-# finished (or failed at). Pulse matches to the most recent non-terminal
-# deployment for the repo_slug and advances its status.
+class ApproveDeploymentRequest(BaseModel):
+    """Optional body for the approve endpoint. Admins can overwrite the dev's
+    env_vars at approve-time — DevOps holds the real connection strings, so it's
+    common for the form submission to ship placeholders that need replacing
+    before Jenkins fetches the spec.
+    """
+    env_vars: Optional[Dict[Environment, str]] = None
+
+
+# Jenkins -> Pulse pipeline callback. Reports the phase the pipeline is
+# CURRENTLY doing (new step-by-step model) or just finished (legacy).
+# Pulse matches to the most recent non-terminal deployment for the
+# repo_slug and advances its status.
 CallbackPhase = Literal[
-    "image_built",       # kaniko push complete
-    "manifest_pushed",   # Create Manifests stage finished; folder in manifests repo
-    "completed",         # all pipeline work done
-    "failed",            # pipeline errored at an unspecified stage
-    "failed_build",      # kaniko stage failed
-    "failed_manifest",   # Create Manifests stage failed
+    # In-progress statuses — fired at the START of each stage so Pulse's UI
+    # mirrors Jenkins's stage view in real time.
+    "building_image",    # kaniko running right now
+    "pushing_manifest",  # manifest gen + git push running right now
+    "cleaning_up",       # workspace wipe + notify hooks running right now
+    # Legacy "X just finished" statuses — older Jenkinsfile versions and
+    # pre-existing records use these. Kept for backwards compat.
+    "image_built",
+    "manifest_pushed",
+    # Terminal success — fired AFTER finally so Jenkins is truly done.
+    "completed",
+    # Terminal failures.
+    "failed",
+    "failed_build",
+    "failed_manifest",
 ]
 
 

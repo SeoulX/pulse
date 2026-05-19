@@ -1,4 +1,5 @@
 import traceback
+import uuid
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -8,6 +9,7 @@ from core.config import settings
 from models.deployment import DeploymentRequest
 from models.user import User
 from schemas.deployment import (
+    ApproveDeploymentRequest,
     CreateDeploymentRequest,
     PipelineCallback,
     RejectDeploymentRequest,
@@ -17,11 +19,14 @@ from services.bitbucket import (
     add_webhook,
     classify_tags,
     delete_tag,
+    fetch_repo_file,
+    inspect_repo,
     list_tags,
     parse_repo_slug,
     push_tag,
 )
 from services.redis_specs import enqueue_job, publish_spec
+from schemas.workers import WorkersParseError, parse_workers_yaml
 
 router = APIRouter(prefix="/deployments", tags=["deployments"])
 
@@ -46,7 +51,11 @@ def _argocd_links(cluster: str, app: str, environments: list[str]) -> dict[str, 
     if not base:
         return {}
     return {
-        env: f"{base}/applications/argocd/{app}-{env}" for env in environments
+        # Naming pattern from kl-1/applicationset.yml:
+        #   '{{ index .path.segments 1 }}-app-{{ .path.basename }}'
+        # i.e. <app>-app-<env>, not <app>-<env>.
+        env: f"{base}/applications/argocd/{app}-app-{env}"
+        for env in environments
     }
 
 
@@ -114,11 +123,19 @@ def _build_jenkins_spec(d: DeploymentRequest) -> dict:
         "tolerations": _CLUSTER_TOLERATIONS.get(d.cluster, []),
         "hostAliases": _host_aliases_for(d.cluster),
     }
+    # ScaledJob multi-worker spec: emit only when present so the generator's
+    # dispatch (`spec.workers // empty`) routes to scaledjob-multi.sh.
+    if d.workers:
+        spec["workers"] = d.workers
     if profile:
         spec["profile"] = profile
     spec["domainZone"] = d.domain_zone
     if d.domain:
         spec["domain"] = d.domain
+    # Explicit ingress override: omit when None so generate-manifests.sh
+    # falls back to its default (true for ingress-bearing profiles).
+    if d.needs_ingress is not None:
+        spec["needsIngress"] = d.needs_ingress
     # Container args precedence: explicit override (rare; admin/API only) wins,
     # else fall back to the role's default. Form doesn't surface args anymore.
     args = dict(_ROLE_DEFAULT_ARGS.get(d.role or "", {}))
@@ -130,12 +147,13 @@ def _build_jenkins_spec(d: DeploymentRequest) -> dict:
         spec["args"] = args
     if profile in ("api", "api-worker"):
         # Per-env HPA defaults — form doesn't surface these, devs get sensible
-        # values automatically. Staging stays small (1–3); production scales
-        # higher (1–5). Both target 80% CPU. Override via `hpa` field if needed.
+        # values automatically. Staging stays small (1–3); production keeps a
+        # 2-pod floor so HA + rolling updates work without downtime, scaling
+        # up to 5. Both target 80% CPU. Override via `hpa` field if needed.
         autoscaler = {
             "type": "HPA",
             "staging":    {"min": 1, "max": 3, "target_cpu": 80},
-            "production": {"min": 1, "max": 5, "target_cpu": 80},
+            "production": {"min": 2, "max": 5, "target_cpu": 80},
         }
         # Allow API-level override: hpa = {"staging": {...}, "production": {...}}.
         for env_name, override in (d.hpa or {}).items():
@@ -186,6 +204,9 @@ def serialize(d: DeploymentRequest) -> dict:
         "rejectionReason": d.rejection_reason,
         "trackToken": d.track_token,
         "trackUrl": f"/deploy/track/{d.track_token}",
+        "submissionId": d.submission_id,
+        "workers": d.workers,
+        "needsIngress": d.needs_ingress,
         "createdAt": d.created_at.isoformat(),
     }
 
@@ -216,6 +237,7 @@ def serialize_public(d: DeploymentRequest) -> dict:
         "rejectionReason": d.rejection_reason,
         "approvedAt": d.approved_at.isoformat() if d.approved_at else None,
         "trackToken": d.track_token,
+        "submissionId": d.submission_id,
         "createdAt": d.created_at.isoformat(),
     }
 
@@ -278,11 +300,55 @@ async def list_deployments(admin: User = Depends(require_admin)):
 
 @router.get("/track/{token}")
 async def track_deployment(token: str):
-    """Public: look up a deployment request by its opaque track token."""
+    """Public: look up a deployment request by its opaque track token.
+
+    SEV — the response bundles every sibling record (same submission_id)
+    so a multi-env submit renders all its envs under ONE tracker URL,
+    even though each env is its own independent record on the backend.
+
+    submission_id is a display-only foreign-key; nothing on the write
+    path reads or aggregates it, so it can't re-introduce the aggregate
+    race we just fixed.
+
+    Response shape:
+        { primaryToken, submissionId, records: [public_record, ...] }
+    Records are sorted staging-first so the UI rendering is stable.
+    Legacy single-record submissions return one record with no siblings.
+    """
     dep = await DeploymentRequest.find_one(DeploymentRequest.track_token == token)
     if not dep:
         raise HTTPException(status_code=404, detail="Tracking link not found")
-    return serialize_public(dep)
+    records = [dep]
+    if dep.submission_id:
+        siblings = await DeploymentRequest.find(
+            DeploymentRequest.submission_id == dep.submission_id,
+            DeploymentRequest.id != dep.id,
+        ).to_list()
+        records.extend(siblings)
+    # Stable staging-before-production ordering for the UI (alphabetical
+    # would put production first; we want the bootstrap/promotion order).
+    _ENV_ORDER = {"staging": 0, "production": 1}
+    records.sort(key=lambda r: _ENV_ORDER.get(
+        r.environments[0] if r.environments else "", 99
+    ))
+    return {
+        "primaryToken": token,
+        "submissionId": dep.submission_id,
+        "records": [serialize_public(r) for r in records],
+    }
+
+
+@router.get("/inspect/{repo_slug}")
+async def inspect_repo_handler(repo_slug: str):
+    """Pre-submit check used by the deployment form.
+
+    Reports which build-relevant files exist in the Bitbucket repo so the
+    form can block submission when the default pipeline would fail (no
+    devops/Dockerfile.* and no custom Jenkinsfile), AND which envs are
+    already bootstrapped in manifests-seven-gen-v2 across both clusters
+    so the form can disable already-deployed env chips.
+    """
+    return await inspect_repo(repo_slug)
 
 
 # Statuses that don't yet have a finalized spec or are no longer dispatchable.
@@ -351,46 +417,97 @@ async def get_jenkins_spec(repo_slug: str, request: Request, tag: str | None = N
 
 @router.post("", status_code=201)
 async def create_deployment(body: CreateDeploymentRequest):
-    """Public: any dev can submit. Request enters pending_approval; no dispatch yet."""
+    """Public: any dev can submit.
+
+    SEV — one DeploymentRequest per env. A form submit for
+    `[staging, production]` produces two independent records, each with
+    its own track_token and lifecycle. Sibling records share a
+    `submission_id` so the form/admin can group them. This eliminates
+    the aggregate-status race that bit us pre-SEV: each record's
+    `status` is just its single env's state, no synthesis required.
+    """
     try:
         slug = parse_repo_slug(body.repo_url)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-    dep = DeploymentRequest(
-        repo_slug=slug,
-        repo_url=body.repo_url,
-        team=body.team,
-        workload_kind=body.workload_kind,
-        role=body.role,
-        with_worker=body.with_worker,
-        cluster=body.cluster,
-        environments=body.environments,
-        env_vars=body.env_vars,
-        domain=body.domain,
-        domain_zone=body.domain_zone,
-        port=body.port,
-        args=body.args,
-        hpa=body.hpa,
-        requested_by=body.requested_by,
-    )
-    await dep.insert()
+    if not body.environments:
+        raise HTTPException(status_code=400, detail="At least one environment is required.")
 
-    # Preview-only at submission time — just so the dev sees what would happen.
-    preview = await _build_planned(dep)
+    # ScaledJob: pull devops/workers.yml from the customer's repo and parse.
+    # The spec is stored on every record so Phase 2's manifest generator
+    # consumes it without re-fetching. Bad YAML or schema errors → 400 with
+    # line-grained messages so the dev can fix workers.yml.
+    parsed_workers = None
+    if body.workload_kind == "ScaledJob":
+        workers_yaml = await fetch_repo_file(slug, "devops/workers.yml")
+        if not workers_yaml:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"ScaledJob requires devops/workers.yml at the root of "
+                    f"the {slug} repo. See manComm/05-14-26/JER-dc-ml-scrapers.md "
+                    f"for the schema."
+                ),
+            )
+        try:
+            parsed_workers = parse_workers_yaml(workers_yaml).model_dump()
+        except WorkersParseError as e:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "message": "devops/workers.yml failed validation",
+                    "errors": e.errors,
+                },
+            )
+
+    submission_id = uuid.uuid4().hex
+    created: list[DeploymentRequest] = []
+    for env in body.environments:
+        env_vars_for_env = (body.env_vars or {}).get(env, "")
+        dep = DeploymentRequest(
+            repo_slug=slug,
+            repo_url=body.repo_url,
+            team=body.team,
+            workload_kind=body.workload_kind,
+            role=body.role,
+            with_worker=body.with_worker,
+            cluster=body.cluster,
+            environments=[env],
+            env_vars={env: env_vars_for_env} if env_vars_for_env else {},
+            domain=body.domain,
+            domain_zone=body.domain_zone,
+            port=body.port,
+            args=body.args,
+            hpa=body.hpa,
+            requested_by=body.requested_by,
+            submission_id=submission_id,
+            workers=parsed_workers,
+            needs_ingress=body.needs_ingress,
+        )
+        await dep.insert()
+        created.append(dep)
 
     print("=" * 60)
-    print(f"[DEPLOYMENT SUBMITTED] {slug} — awaiting DevOps approval")
-    print(f"  requested_by: {dep.requested_by}")
-    print(f"  track_token : {dep.track_token}")
+    print(f"[DEPLOYMENT SUBMITTED] {slug} — {len(created)} env record(s), awaiting DevOps approval")
+    print(f"  submission_id: {submission_id}")
+    print(f"  requested_by : {created[0].requested_by}")
+    for d in created:
+        env_name = d.environments[0] if d.environments else "(none)"
+        print(f"  {env_name:10s}  id={d.id}  token={d.track_token}")
     print("=" * 60, flush=True)
 
-    return {**serialize(dep), "planned": preview}
+    out = []
+    for d in created:
+        preview = await _build_planned(d)
+        out.append({**serialize(d), "planned": preview})
+    return out
 
 
 @router.post("/{deployment_id}/approve")
 async def approve_deployment(
     deployment_id: str,
+    body: ApproveDeploymentRequest = ApproveDeploymentRequest(),
     admin: User = Depends(require_admin),
 ):
     dep = await DeploymentRequest.get(deployment_id)
@@ -401,6 +518,17 @@ async def approve_deployment(
             status_code=409,
             detail=f"Cannot approve — current status is '{dep.status}'",
         )
+
+    # DevOps overrides env_vars at approve-time (internal connection strings,
+    # secrets, etc.). Only update keys for envs that were actually requested —
+    # blocks for non-requested envs would never reach Jenkins anyway, but it
+    # keeps the stored doc cleaner.
+    if body.env_vars:
+        merged = dict(dep.env_vars or {})
+        for env in dep.environments:
+            if env in body.env_vars:
+                merged[env] = body.env_vars[env]
+        dep.env_vars = merged
 
     dep.approved_by = admin.email
     dep.approved_at = datetime.now(timezone.utc)
@@ -521,6 +649,14 @@ _PER_ENV_TERMINAL = _FAILURE_STATUSES | {"completed"}
 # Phase ordering for the worst-of aggregate. Failures rank highest so any env
 # failure surfaces on the aggregate pill. completed ranks lowest among terminals
 # so it only wins when every env is also completed.
+#
+# New step-by-step statuses (Jenkinsfile fires AT START of each stage so
+# Pulse mirrors Jenkins's stage view exactly):
+#   building_image    → kaniko running RIGHT NOW
+#   pushing_manifest  → manifest gen + git push running RIGHT NOW
+#   cleaning_up       → workspace wipe + notify hooks running RIGHT NOW
+# Legacy "X done" statuses (image_built, manifest_pushed) share the same
+# ranks for backwards-compat with already-bootstrapped records.
 _PHASE_RANK: dict[str, int] = {
     "pending_approval": 0,
     "pending":          0,
@@ -528,9 +664,12 @@ _PHASE_RANK: dict[str, int] = {
     "dry_run":          1,
     "webhook_added":    2,
     "tags_pushed":      3,
+    "building_image":   4,
     "image_built":      4,
+    "pushing_manifest": 5,
     "manifest_pushed":  5,
-    "completed":        6,
+    "cleaning_up":      6,
+    "completed":        7,
     # Failures rank highest — worst-of picks them over any in-flight env.
     "failed":           10,
     "failed_build":     11,
@@ -543,7 +682,10 @@ def _aggregate_status(envs: list[str], env_statuses: dict[str, str], fallback: s
     """Worst-of across env_statuses. Failures > non-terminal > completed.
 
     `fallback` is the legacy pre-callback status (pending_approval, approved,
-    webhook_added, tags_pushed) — used when no env has reported yet."""
+    webhook_added, tags_pushed) — used when no env has reported yet AND
+    folded into the min() when some envs haven't reported, so the aggregate
+    can't synthesize "completed" from a single env's report while the other
+    is still silent."""
     reported = [env_statuses.get(e) for e in envs if env_statuses.get(e)]
     if not reported:
         return fallback
@@ -554,8 +696,14 @@ def _aggregate_status(envs: list[str], env_statuses: dict[str, str], fallback: s
     # Completed only wins if EVERY requested env is completed.
     if all(s == "completed" for s in reported) and len(reported) == len(envs):
         return "completed"
-    # Otherwise return the least-advanced non-terminal (the lagging env).
-    return min(reported, key=lambda s: _PHASE_RANK.get(s, 0))
+    # Some env hasn't reported yet — include the fallback in the worst-of
+    # so production hitting "completed" first can't bypass staging while
+    # staging is still mid-build. Without this fold-in, min([completed])
+    # would naively return "completed".
+    pool = list(reported)
+    if len(reported) < len(envs):
+        pool.append(fallback)
+    return min(pool, key=lambda s: _PHASE_RANK.get(s, 0))
 
 
 @router.post("/callback/{repo_slug}")
@@ -573,6 +721,13 @@ async def pipeline_callback(repo_slug: str, body: PipelineCallback):
         dep = await DeploymentRequest.find_one(
             DeploymentRequest.repo_slug == repo_slug,
             {"environments": body.env},
+            # SEV records store the env's state in `status`, so this catches
+            # already-completed/failed single-env records that have an empty
+            # env_statuses dict.
+            {"status": {"$nin": list(_PER_ENV_TERMINAL)}},
+            # Legacy multi-env: also block writing to an env slot that's
+            # already terminal (e.g. failed_manifest must not be overwritten
+            # by a stale 'completed' callback from the other env).
             {f"env_statuses.{body.env}": {"$nin": list(_PER_ENV_TERMINAL)}},
             sort=[("createdAt", -1)],
         )
@@ -593,26 +748,29 @@ async def pipeline_callback(repo_slug: str, body: PipelineCallback):
         return {"matched": False, "repoSlug": repo_slug}
 
     if body.env:
-        # Initialize the dicts (Beanie keeps Pydantic defaults but older docs
-        # may not have them populated).
-        env_statuses = dict(dep.env_statuses or {})
-        env_errors = dict(dep.env_errors or {})
-        env_statuses[body.env] = body.status
-        if body.error and body.status in _FAILURE_STATUSES:
-            env_errors[body.env] = body.error
-        dep.env_statuses = env_statuses
-        dep.env_errors = env_errors
-
-        # Recompute aggregate. Use the pre-callback aggregate as fallback when
-        # this is the first env to report (so the pill doesn't regress from
-        # tags_pushed → pending while waiting on the other env).
-        dep.status = _aggregate_status(
-            dep.environments, env_statuses, fallback=dep.status
-        )
-        # Aggregate error: pick any env error to surface in the legacy `error`
-        # field. UI prefers env_errors per-env when rendering.
-        if env_errors:
-            dep.error = next(iter(env_errors.values()))
+        # SEV: single-env records map status directly — no aggregate needed,
+        # no synthesis-race possible. We detect this by environments being
+        # exactly [body.env]. Legacy multi-env records fall through to the
+        # env_statuses + worst-of aggregate path.
+        if len(dep.environments) == 1 and dep.environments[0] == body.env:
+            dep.status = body.status
+            if body.status in _FAILURE_STATUSES and body.error:
+                dep.error = body.error
+        else:
+            # Legacy multi-env record. Initialize the dicts (Beanie keeps
+            # Pydantic defaults but older docs may not have them populated).
+            env_statuses = dict(dep.env_statuses or {})
+            env_errors = dict(dep.env_errors or {})
+            env_statuses[body.env] = body.status
+            if body.error and body.status in _FAILURE_STATUSES:
+                env_errors[body.env] = body.error
+            dep.env_statuses = env_statuses
+            dep.env_errors = env_errors
+            dep.status = _aggregate_status(
+                dep.environments, env_statuses, fallback=dep.status
+            )
+            if env_errors:
+                dep.error = next(iter(env_errors.values()))
     else:
         dep.status = body.status
         if body.status in _FAILURE_STATUSES and body.error:

@@ -60,6 +60,21 @@ class DeploymentRequest(Document):
     approved_at: Optional[datetime] = Field(default=None, alias="approvedAt")
     rejection_reason: Optional[str] = Field(default=None, alias="rejectionReason")
     track_token: Indexed(str) = Field(default_factory=_new_token, alias="trackToken")
+    # SEV: a single form submit now creates N records (one per env). All N
+    # share the same submission_id so the form's success card can list
+    # sibling tracker URLs together, and admins can see the request as a
+    # unit. Optional for backwards compat with pre-SEV multi-env records.
+    submission_id: Optional[str] = Field(default=None, alias="submissionId")
+    # ScaledJob workers (DC/ML scrapers, multi-queue layouts). Pulse
+    # fetches devops/workers.yml from the customer's repo at submit time,
+    # parses it via schemas/workers.py, and stores the parsed spec here.
+    # Phase 2 will plumb this through to the manifest generator. None for
+    # non-ScaledJob workloads or repos that don't have a workers.yml.
+    workers: Optional[Dict[str, Any]] = Field(default=None)
+    # Public ingress + TLS cert opt-out. None means "let the role decide
+    # at generate-manifests.sh time" (the historical default). True/False
+    # force the spec.needsIngress flag explicitly.
+    needs_ingress: Optional[bool] = Field(default=None, alias="needsIngress")
     created_at: datetime = Field(
         default_factory=lambda: datetime.now(timezone.utc), alias="createdAt"
     )

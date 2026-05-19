@@ -192,6 +192,38 @@ export interface SubmittedDeployment {
   trackUrl?: string;
 }
 
+interface WorkersSummary {
+  valid: boolean;
+  errors?: string[];
+  queue_family?: string;
+  zone?: string;
+  component_count?: number;
+  worker_count?: number;
+  components?: { name: string; workers: string[] }[];
+}
+
+interface RepoInspection {
+  slug: string;
+  exists: boolean;
+  has_devops: boolean;
+  has_dockerfile_staging: boolean;
+  has_dockerfile_prod: boolean;
+  has_jenkinsfile: boolean;
+  has_workers_yml: boolean;
+  // {cluster: envs-already-bootstrapped}. Scanned across both kl-1 and
+  // kl-2 so the form can warn even when the dev picks the "empty" cluster
+  // unaware that the app already lives on the other.
+  existing_envs: Record<string, string[]>;
+  // Sniffed from package.json / requirements.txt / pyproject.toml /
+  // workers.yaml — null when no clear signal.
+  inferred_workload_kind: string | null;
+  inferred_role: string | null;
+  inferred_team: string | null;
+  // Present when devops/workers.yml exists. Parsed at inspect time so the
+  // form can show the dev exactly what was found before they hit submit.
+  workers_summary: WorkersSummary | null;
+}
+
 interface DeploymentFormProps {
   onSubmitted?: (dep: SubmittedDeployment) => void;
 }
@@ -222,15 +254,25 @@ export function DeploymentForm({ onSubmitted }: DeploymentFormProps = {}) {
   const [port, setPort] = useState(8000);
   const [showFrontendEnv, setShowFrontendEnv] = useState(false);
   const [activeEnvTab, setActiveEnvTab] = useState<Environment>("staging");
+  // Ingress is opt-in / opt-out — defaults to true for role=API/UI/Streamlit,
+  // false for Worker/ScaledJob/CronJob. Tracked separately from role so the
+  // user can override either way after picking a role.
+  const [needsIngress, setNeedsIngress] = useState(true);
+  const [ingressTouched, setIngressTouched] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
-  const [lastSubmitted, setLastSubmitted] = useState<SubmittedDeployment | null>(
+  // SEV: a single form submit can create N records (one per env). We keep
+  // the array so the success card can show a tracker URL for each sibling.
+  const [lastSubmitted, setLastSubmitted] = useState<SubmittedDeployment[] | null>(
     null
   );
   const [lastConflictStrategy, setLastConflictStrategy] = useState<
     string | null
   >(null);
-  const [copied, setCopied] = useState(false);
+  const [repoInspection, setRepoInspection] = useState<RepoInspection | null>(
+    null
+  );
+  const [inspecting, setInspecting] = useState(false);
 
   useEffect(() => {
     if (user?.email && !requestedBy) setRequestedBy(user.email);
@@ -239,35 +281,65 @@ export function DeploymentForm({ onSubmitted }: DeploymentFormProps = {}) {
   const isDeployment = workloadKind === "Deployment";
   const isFrontend = team === "Frontend";
   const isDcMl = team === "DC/ML";
-  const isMultiWorker = isDcMl && workloadKind === "ScaledJob";
+  // ScaledJob = multi-worker (Phase 1). Team is no longer the lock (Phase 0
+  // decision); workloadKind alone determines whether the workers section
+  // shows.
+  const isScaledJob = workloadKind === "ScaledJob";
+  // Kept under the legacy name for the existing render branches that gate
+  // on it. Same value as isScaledJob now.
+  const isMultiWorker = isScaledJob;
   const envsDisabled = environments.length === 0;
-  const envRequired = !isFrontend && !isMultiWorker;
-  const envVisible = (!isFrontend || showFrontendEnv) && !isMultiWorker;
+  // ScaledJob: env_vars textarea stays visible because the parent
+  // (L3 component) config.properties needs the shared REDIS_*, BASE_URL,
+  // PROXY_URI etc. — same content gets copied into every component's
+  // config.properties by Phase 2's generator. (Verified by diffing v1
+  // scoup/scrapy article vs section configs — identical content.)
+  const envRequired = !isFrontend;
+  const envVisible = !isFrontend || showFrontendEnv;
   const stagingPicked = environments.includes("staging");
   const productionPicked = environments.includes("production");
   const portUsed = isDeployment && role !== "Worker" && !isMultiWorker;
-  const domainUsed = isDeployment && !isMultiWorker;
+  // Ingress UI is gated on three things: a Deployment workload, not a
+  // multi-worker / ScaledJob, AND the user-controlled "Needs public ingress"
+  // checkbox being on. Unchecking the box removes the DNS zone selector,
+  // host-override field, and host-preview rows below.
+  const domainUsed = isDeployment && !isMultiWorker && needsIngress;
   const roleVisible = isDeployment && !isMultiWorker;
 
-  // Team locks: Frontend → Deployment + UI; DC/ML → ScaledJob (role hidden).
+  // Team is a label only — it doesn't cascade into role/workload anymore.
+  // Locks now live entirely at the role level (see role-lock effect below).
+  // We still reset showFrontendEnv when leaving Frontend so the runtime
+  // env-var checkbox doesn't leave stale state in a non-Frontend submission.
   useEffect(() => {
-    if (isFrontend) {
-      setRole("UI");
-      setWorkloadKind("Deployment");
-    } else if (isDcMl) {
-      setWorkloadKind("ScaledJob");
-      setShowFrontendEnv(false);
-    } else {
-      setRole((prev) => (prev === "UI" ? "API" : prev));
-      setShowFrontendEnv(false);
-    }
-  }, [isFrontend, isDcMl]);
+    if (!isFrontend) setShowFrontendEnv(false);
+  }, [isFrontend]);
 
   // Default container port from the role unless dev overrode it.
   useEffect(() => {
     const portDef = ROLE_DEFAULT_PORT[role];
     if (portDef) setPort(portDef);
   }, [role]);
+
+  // Default needsIngress from the role — API/UI/Streamlit get true, Worker
+  // gets false (no public HTTP path). Skip once the user has toggled the
+  // checkbox manually so we don't fight their choice.
+  useEffect(() => {
+    if (ingressTouched) return;
+    const ingressByRole = role === "API" || role === "UI" || role === "Streamlit";
+    setNeedsIngress(ingressByRole);
+  }, [role, ingressTouched]);
+
+  // Roles that are HTTP servers → always Deployment. (UI is also in this
+  // set but the Frontend team lock already handles it; listing it here is
+  // belt-and-braces in case the form ever lets UI escape Frontend team.)
+  // Worker is intentionally not in this set — workers can legitimately be
+  // Deployment / ScaledJob / CronJob depending on the trigger pattern.
+  useEffect(() => {
+    const deploymentOnly = role === "API" || role === "UI" || role === "Streamlit";
+    if (deploymentOnly && workloadKind !== "Deployment") {
+      setWorkloadKind("Deployment");
+    }
+  }, [role, workloadKind]);
 
   // Keep activeEnvTab pointing at a picked env so the textarea is always
   // showing something the user actually selected.
@@ -276,6 +348,43 @@ export function DeploymentForm({ onSubmitted }: DeploymentFormProps = {}) {
       setActiveEnvTab(environments[0]);
     }
   }, [environments, activeEnvTab]);
+
+  // Scan the Bitbucket repo for devops/Dockerfile.* and Jenkinsfile so we
+  // can block submission early when the default pipeline would fail at
+  // build time. Debounced so a typing user doesn't hammer Bitbucket's API.
+  // (deriveSlug runs again at line ~335 — cheap pure fn, kept colocated
+  // with each consumer for readability.)
+  const inspectSlug = deriveSlug(repoUrl);
+  useEffect(() => {
+    if (inspectSlug.valid !== "good") {
+      setRepoInspection(null);
+      setInspecting(false);
+      return;
+    }
+    let cancelled = false;
+    setInspecting(true);
+    const timer = setTimeout(async () => {
+      try {
+        const res = await apiFetch(
+          `/api/deployments/inspect/${inspectSlug.slug}`
+        );
+        if (cancelled) return;
+        if (res.ok) {
+          setRepoInspection((await res.json()) as RepoInspection);
+        } else {
+          setRepoInspection(null);
+        }
+      } catch {
+        if (!cancelled) setRepoInspection(null);
+      } finally {
+        if (!cancelled) setInspecting(false);
+      }
+    }, 500);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [inspectSlug.slug, inspectSlug.valid]);
 
   const toggleEnv = (env: Environment) => {
     setEnvironments((prev) =>
@@ -289,6 +398,96 @@ export function DeploymentForm({ onSubmitted }: DeploymentFormProps = {}) {
   // K8s names + DNS-1123 hosts can't. Jenkins normalizes to dashes for the
   // `app` field in spec.json, so the preview mirrors that.
   const appName = slug.replace(/_/g, "-");
+
+  // Repos with their own Jenkinsfile control their own build and bypass the
+  // default pipeline's devops/ requirement. Otherwise we need both Dockerfiles
+  // present (Jenkins errors at build time if either is missing for the
+  // matching tag pattern). Only treat the check as authoritative once we
+  // have a successful inspection result.
+  const repoBlockReason: string | null = (() => {
+    if (!repoInspection || repoInspection.has_jenkinsfile) return null;
+    if (!repoInspection.exists) return "Repo not found in the metawhale workspace.";
+    const missing: string[] = [];
+    if (!repoInspection.has_devops) missing.push("devops/");
+    if (!repoInspection.has_dockerfile_staging)
+      missing.push("devops/Dockerfile.staging");
+    if (!repoInspection.has_dockerfile_prod)
+      missing.push("devops/Dockerfile.prod");
+    return missing.length
+      ? `Repo is missing: ${missing.join(", ")}.`
+      : null;
+  })();
+
+  // Find the cluster the repo is already bootstrapped on (if any). We lock
+  // the form to that cluster so the dev can't accidentally pick the wrong
+  // one — re-bootstrapping into a parallel cluster is almost never intended.
+  const deployedClusterEntries = repoInspection?.existing_envs
+    ? Object.entries(repoInspection.existing_envs).filter(
+        ([, envs]) => envs.length > 0
+      )
+    : [];
+  // Single deployed cluster → lock the picker to it. Two clusters with
+  // existing manifests is rare (mid-migration) — surface the situation in
+  // a banner but don't auto-lock since either is plausible.
+  const lockedCluster: Cluster | null =
+    deployedClusterEntries.length === 1
+      ? (deployedClusterEntries[0][0] as Cluster)
+      : null;
+  const existingEnvsHere: string[] =
+    repoInspection?.existing_envs?.[cluster] ?? [];
+  const missingEnvsHere: Environment[] = ENVIRONMENTS.map((e) => e.value).filter(
+    (e) => !existingEnvsHere.includes(e)
+  );
+
+  // When a single cluster is locked, snap form state to match: jump to that
+  // cluster and auto-select only the envs that still need bootstrapping.
+  useEffect(() => {
+    if (!repoInspection) return;
+    if (lockedCluster && cluster !== lockedCluster) {
+      setCluster(lockedCluster);
+      return; // wait for cluster change to re-trigger this effect
+    }
+    if (existingEnvsHere.length > 0) {
+      setEnvironments(missingEnvsHere);
+    }
+    // Keying on the JSON-stringified existing_envs collapses repeated polls
+    // with identical results into a single state update.
+  }, [JSON.stringify(repoInspection?.existing_envs ?? {}), cluster]);
+
+  // Auto-fill workload kind / role / team from the sniffed repo signals.
+  // The existing team-lock effect handles the cascade (Frontend → forces
+  // Deployment/UI, DC/ML → forces ScaledJob), so setting team first is
+  // sufficient; we still set workloadKind/role explicitly for the Backend
+  // case where the team-lock leaves those alone.
+  useEffect(() => {
+    if (!repoInspection) return;
+    if (repoInspection.inferred_team) {
+      setTeam(repoInspection.inferred_team as Team);
+    }
+    if (repoInspection.inferred_workload_kind) {
+      setWorkloadKind(repoInspection.inferred_workload_kind as WorkloadKind);
+    }
+    // For ScaledJob the backend returns inferred_role=null. Force role to
+    // "Worker" so the role-lock effect doesn't snap workloadKind back to
+    // "Deployment" (only API/UI/Streamlit trigger the snap). For other
+    // inferences, only set role if the backend told us what it should be.
+    if (repoInspection.inferred_role) {
+      setRole(repoInspection.inferred_role as Role);
+    } else if (repoInspection.inferred_workload_kind === "ScaledJob") {
+      setRole("Worker");
+    }
+    // DC/ML scrapers live on kl-2 by convention. Snap the cluster picker
+    // when a workers.yml-bearing repo lands so the dev doesn't have to
+    // remember. The cluster-lock effect (downstream) only overrides if
+    // the repo is already bootstrapped elsewhere — that path still wins.
+    if (repoInspection.inferred_workload_kind === "ScaledJob") {
+      setCluster("kl-2");
+    }
+  }, [
+    repoInspection?.inferred_team,
+    repoInspection?.inferred_workload_kind,
+    repoInspection?.inferred_role,
+  ]);
 
   // Mirror common.sh load_env_defaults: production uses the base host as-is;
   // staging splices `-staging` into the leftmost label. The override field
@@ -305,14 +504,16 @@ export function DeploymentForm({ onSubmitted }: DeploymentFormProps = {}) {
     .filter((e): e is Environment => e === "staging" || e === "production")
     .map((e) => ({ env: e, host: hostFor(e) }));
 
-  const availableRoles = isFrontend
-    ? ROLES.filter((r) => r.value === "UI")
-    : ROLES.filter((r) => r.value !== "UI");
-  const availableKinds = isFrontend
-    ? WORKLOAD_KINDS.filter((k) => k.value === "Deployment")
-    : isDcMl
-      ? WORKLOAD_KINDS.filter((k) => k.value === "ScaledJob")
-      : WORKLOAD_KINDS;
+  // Team no longer filters roles/kinds — picker stays free so users can
+  // re-tag without losing their workload selection. Only role-based locks
+  // remain authoritative.
+  const availableRoles = ROLES;
+  const roleLocksToDeploy =
+    role === "API" || role === "UI" || role === "Streamlit";
+  // Show ALL workload kinds always; non-Deployment pills get disabled when
+  // role locks to Deployment so the user sees the constraint instead of
+  // wondering where the other pills went.
+  const availableKinds = WORKLOAD_KINDS;
 
   const resetForm = () => {
     setRepoUrl("");
@@ -339,7 +540,6 @@ export function DeploymentForm({ onSubmitted }: DeploymentFormProps = {}) {
     e.preventDefault();
     setError("");
     setLastSubmitted(null);
-    setCopied(false);
     if (!EMAIL_RE.test(requestedBy.trim())) {
       setError("Enter a valid email.");
       return;
@@ -362,6 +562,21 @@ export function DeploymentForm({ onSubmitted }: DeploymentFormProps = {}) {
         setError(`Production env vars are required for ${team}.`);
         return;
       }
+    }
+    // ScaledJob gate: workers.yml must exist in devops/ and parse. The
+    // inspect endpoint surfaces this in repoInspection.workers_summary;
+    // we just check `valid`. The submit-time fetch in the backend is the
+    // authoritative validation — this is just an early-block hint.
+    if (
+      isScaledJob &&
+      (!repoInspection?.has_workers_yml ||
+        repoInspection?.workers_summary?.valid === false)
+    ) {
+      setError(
+        "ScaledJob needs a valid devops/workers.yml in the repo. " +
+        "See the workers summary above the repo field for details."
+      );
+      return;
     }
     setLoading(true);
 
@@ -386,6 +601,10 @@ export function DeploymentForm({ onSubmitted }: DeploymentFormProps = {}) {
           domain: overrideHost && domain.trim() ? domain.trim() : null,
           domain_zone: domainZone,
           port,
+          // ScaledJob never gets an ingress — workers are queue-driven.
+          // Force false on submit so a stale form-state default can't slip
+          // through and trigger an ingress + cert that nothing routes to.
+          needs_ingress: isScaledJob ? false : needsIngress,
         }),
       });
 
@@ -399,9 +618,17 @@ export function DeploymentForm({ onSubmitted }: DeploymentFormProps = {}) {
       }
 
       const data = await res.json();
-      onSubmitted?.(data as SubmittedDeployment);
-      setLastSubmitted(data as SubmittedDeployment);
-      setLastConflictStrategy(data.planned?.conflict_strategy ?? null);
+      // SEV: API now returns an array (one record per env). Coerce legacy
+      // single-object responses to a 1-item array for forward compat.
+      const records: SubmittedDeployment[] = Array.isArray(data)
+        ? data
+        : [data];
+      records.forEach((r) => onSubmitted?.(r));
+      setLastSubmitted(records);
+      setLastConflictStrategy(
+        (records[0] as unknown as { planned?: { conflict_strategy?: string } })
+          ?.planned?.conflict_strategy ?? null
+      );
       mutate("/api/deployments");
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : "Something went wrong");
@@ -410,13 +637,11 @@ export function DeploymentForm({ onSubmitted }: DeploymentFormProps = {}) {
     }
   };
 
-  if (lastSubmitted && lastSubmitted.trackUrl) {
+  if (lastSubmitted && lastSubmitted.length > 0) {
     return (
       <SuccessCard
         submitted={lastSubmitted}
         conflictStrategy={lastConflictStrategy}
-        copied={copied}
-        setCopied={setCopied}
         onSubmitAnother={resetForm}
       />
     );
@@ -427,6 +652,112 @@ export function DeploymentForm({ onSubmitted }: DeploymentFormProps = {}) {
       {error && (
         <div className="rounded-xl border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700 dark:border-red-900/50 dark:bg-red-900/20 dark:text-red-400">
           {error}
+        </div>
+      )}
+
+      {repoBlockReason && (
+        <div className="flex items-start gap-2 rounded-xl border border-amber-300 bg-amber-50 px-3 py-2 text-sm text-amber-900 dark:border-amber-900/50 dark:bg-amber-900/20 dark:text-amber-300">
+          <AlertTriangle className="mt-0.5 h-4 w-4 flex-shrink-0" />
+          <div>
+            <div className="font-medium">Build files missing</div>
+            <div className="text-xs">
+              {repoBlockReason} The default Jenkins pipeline needs both
+              Dockerfiles, or commit a root <code className="rounded bg-amber-100 px-1 font-mono text-[11px] dark:bg-amber-900/40">Jenkinsfile</code>{" "}
+              to override.
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ScaledJob: surface devops/workers.yml status. Block submission
+          when the file's missing or fails validation. */}
+      {isScaledJob && repoInspection && (
+        repoInspection.has_workers_yml && repoInspection.workers_summary?.valid ? (
+          <div className="flex items-start gap-2 rounded-xl border border-emerald-300 bg-emerald-50 px-3 py-2 text-sm text-emerald-900 dark:border-emerald-900/50 dark:bg-emerald-900/20 dark:text-emerald-300">
+            <Check className="mt-0.5 h-4 w-4 flex-shrink-0" />
+            <div>
+              <div className="font-medium">
+                workers.yml found — {repoInspection.workers_summary.worker_count} workers across {repoInspection.workers_summary.component_count} component{repoInspection.workers_summary.component_count === 1 ? "" : "s"}
+              </div>
+              <ul className="mt-0.5 space-y-0.5 text-xs">
+                {repoInspection.workers_summary.components?.map((c) => (
+                  <li key={c.name}>
+                    <span className="font-mono">{c.name}</span>: {c.workers.join(", ")}
+                  </li>
+                ))}
+              </ul>
+              <div className="mt-1 text-xs">
+                queue_family=<span className="font-mono">{repoInspection.workers_summary.queue_family}</span>{" "}
+                zone=<span className="font-mono">{repoInspection.workers_summary.zone}</span>
+              </div>
+            </div>
+          </div>
+        ) : (
+          <div className="flex items-start gap-2 rounded-xl border border-amber-300 bg-amber-50 px-3 py-2 text-sm text-amber-900 dark:border-amber-900/50 dark:bg-amber-900/20 dark:text-amber-300">
+            <AlertTriangle className="mt-0.5 h-4 w-4 flex-shrink-0" />
+            <div>
+              <div className="font-medium">
+                {repoInspection.has_workers_yml
+                  ? "workers.yml failed validation"
+                  : "ScaledJob needs devops/workers.yml"}
+              </div>
+              {repoInspection.workers_summary?.errors?.length ? (
+                <ul className="mt-0.5 space-y-0.5 text-xs font-mono">
+                  {repoInspection.workers_summary.errors.map((e, i) => (
+                    <li key={i}>· {e}</li>
+                  ))}
+                </ul>
+              ) : (
+                <div className="text-xs">
+                  Commit a <code className="rounded bg-amber-100 px-1 font-mono text-[11px] dark:bg-amber-900/40">devops/workers.yml</code> at the
+                  repo root. See manComm/05-14-26/JER-dc-ml-scrapers.md
+                  for the schema.
+                </div>
+              )}
+            </div>
+          </div>
+        )
+      )}
+
+      {deployedClusterEntries.length > 0 && (
+        <div className="flex items-start gap-2 rounded-xl border border-blue-300 bg-blue-50 px-3 py-2 text-sm text-blue-900 dark:border-blue-900/50 dark:bg-blue-900/20 dark:text-blue-300">
+          <AlertTriangle className="mt-0.5 h-4 w-4 flex-shrink-0" />
+          <div>
+            <div className="font-medium">
+              {deployedClusterEntries.length === 1
+                ? `This repo already has ${deployedClusterEntries[0][1].join(" + ")} deployed on ${deployedClusterEntries[0][0]}`
+                : "This repo is deployed across multiple clusters"}
+            </div>
+            <ul className="mt-0.5 space-y-0.5 text-xs">
+              {deployedClusterEntries.map(([c, envs]) => (
+                <li key={c}>
+                  <span className="font-mono">{c}</span>: {envs.join(", ")}
+                </li>
+              ))}
+            </ul>
+            <div className="mt-1 text-xs">
+              {lockedCluster && missingEnvsHere.length > 0 && (
+                <>
+                  Locked to <span className="font-mono">{lockedCluster}</span>;{" "}
+                  <span className="font-mono">{missingEnvsHere.join(" + ")}</span>{" "}
+                  auto-selected as the remaining env
+                  {missingEnvsHere.length === 1 ? "" : "s"} to bootstrap.
+                </>
+              )}
+              {lockedCluster && missingEnvsHere.length === 0 && (
+                <>
+                  Both envs are already bootstrapped here — there's nothing
+                  left to submit. Tag the repo (vX.Y.Z) to ship a release.
+                </>
+              )}
+              {!lockedCluster && (
+                <>
+                  Pick a cluster manually — the repo has manifests on more
+                  than one and we don't auto-resolve.
+                </>
+              )}
+            </div>
+          </div>
         </div>
       )}
 
@@ -454,7 +785,7 @@ export function DeploymentForm({ onSubmitted }: DeploymentFormProps = {}) {
                 slug: {slug}
               </span>
             ) : (
-              <>Bitbucket workspace must be <code className="rounded bg-muted px-1 font-mono text-[11px]">metawhale</code>.</>
+              <span className="truncate">Workspace: <code className="rounded bg-muted px-1 font-mono text-[11px]">metawhale</code></span>
             )
           }
         >
@@ -501,48 +832,26 @@ export function DeploymentForm({ onSubmitted }: DeploymentFormProps = {}) {
               ))}
             </PillRow>
 
-            <PillRow
-              label="Kind"
-              lockedNote={
-                isFrontend ? "Frontend → Deploy" : isDcMl ? "DC/ML → ScaledJob" : null
-              }
-            >
-              {availableKinds.map((k) => (
-                <button
-                  key={k.value}
-                  type="button"
-                  disabled={isFrontend || isDcMl}
-                  onClick={() => setWorkloadKind(k.value)}
-                  className={`${pillBase} ${
-                    workloadKind === k.value ? pillActive : isFrontend || isDcMl ? pillDisabled : pillIdle
-                  }`}
-                >
-                  {k.label}
-                </button>
-              ))}
-            </PillRow>
-
+            {/* Row order: Role first (sets the suggested workload kind),
+                Kind second (auto-filled by the role / inspect; user can
+                still click any pill — no disables). */}
             {roleVisible && (
               <div>
-                <PillRow
-                  label="Role"
-                  lockedNote={isFrontend ? "Frontend → UI" : null}
-                >
+                <PillRow label="Role" lockedNote={null}>
                   {availableRoles.map((r) => (
                     <button
                       key={r.value}
                       type="button"
-                      disabled={isFrontend}
                       onClick={() => setRole(r.value)}
                       className={`${pillBase} ${
-                        role === r.value ? pillActive : isFrontend ? pillDisabled : pillIdle
+                        role === r.value ? pillActive : pillIdle
                       }`}
                     >
                       {r.label}
                     </button>
                   ))}
                 </PillRow>
-                {role === "API" && !isFrontend && (
+                {role === "API" && (
                   <label className="mt-1.5 flex items-center gap-2 text-xs text-muted-foreground">
                     <input
                       type="checkbox"
@@ -559,40 +868,124 @@ export function DeploymentForm({ onSubmitted }: DeploymentFormProps = {}) {
               </div>
             )}
 
+            <PillRow
+              label="Kind"
+              lockedNote={
+                roleLocksToDeploy ? `${role} suggests Deploy` : null
+              }
+            >
+              {availableKinds.map((k) => (
+                <button
+                  key={k.value}
+                  type="button"
+                  onClick={() => setWorkloadKind(k.value)}
+                  className={`${pillBase} ${
+                    workloadKind === k.value ? pillActive : pillIdle
+                  }`}
+                >
+                  {k.label}
+                </button>
+              ))}
+            </PillRow>
+
             {isMultiWorker && (
               <div className="flex gap-2 rounded-xl border border-blue-300 bg-blue-50 px-3 py-2 text-xs text-blue-800 dark:border-blue-900/50 dark:bg-blue-900/20 dark:text-blue-300">
                 <AlertTriangle className="mt-0.5 h-3.5 w-3.5 flex-shrink-0" />
                 <span>
-                  Scaffolded from <code className="rounded bg-blue-100 px-1 font-mono dark:bg-blue-900/40">devops/workers.yaml</code>.
+                  Scaffolded from <code className="rounded bg-blue-100 px-1 font-mono dark:bg-blue-900/40">devops/workers.yml</code>.
                   Port/host/env-vars come from that file.
                 </span>
               </div>
             )}
 
-            <PillRow label="Cluster">
-              {CLUSTERS.map((c) => (
-                <button
-                  key={c}
-                  type="button"
-                  onClick={() => setCluster(c)}
-                  className={`${pillBase} font-mono ${cluster === c ? pillActive : pillIdle}`}
-                >
-                  {c}
-                </button>
-              ))}
+            {/* Ingress toggle — default flips with role (API/UI/Streamlit
+                → on, Worker → off) but the user can opt in/out either way.
+                Hidden entirely for ScaledJob (workers are queue-driven —
+                ingress never makes sense, and we force needs_ingress=false
+                on submit regardless of checkbox state). */}
+            {!isScaledJob && (
+            <label className="flex items-center gap-2 text-sm">
+              <input
+                type="checkbox"
+                checked={needsIngress}
+                onChange={(e) => {
+                  setNeedsIngress(e.target.checked);
+                  setIngressTouched(true);
+                }}
+                className="h-4 w-4 rounded border-border accent-[#e8871e]"
+              />
+              <span>
+                Needs public ingress + TLS
+                <span className="ml-1 text-xs italic text-muted-foreground">
+                  (off for internal/queue-driven workloads)
+                </span>
+              </span>
+            </label>
+            )}
+
+            <PillRow
+              label="Cluster"
+              lockedNote={
+                lockedCluster ? `locked → already on ${lockedCluster}` : null
+              }
+            >
+              {CLUSTERS.map((c) => {
+                const clusterDisabled =
+                  lockedCluster !== null && c !== lockedCluster;
+                return (
+                  <button
+                    key={c}
+                    type="button"
+                    disabled={clusterDisabled}
+                    title={
+                      clusterDisabled
+                        ? `Repo is already bootstrapped on ${lockedCluster}`
+                        : undefined
+                    }
+                    onClick={() => !clusterDisabled && setCluster(c)}
+                    className={`${pillBase} font-mono ${
+                      clusterDisabled
+                        ? pillDisabled
+                        : cluster === c
+                          ? pillActive
+                          : pillIdle
+                    }`}
+                  >
+                    {c}
+                  </button>
+                );
+              })}
             </PillRow>
 
             <PillRow label="Environments">
               {ENVIRONMENTS.map((env) => {
                 const active = environments.includes(env.value);
+                const alreadyDeployed = existingEnvsHere.includes(env.value);
                 return (
                   <button
                     key={env.value}
                     type="button"
-                    onClick={() => toggleEnv(env.value)}
-                    className={`${pillBase} ${active ? pillActive : pillIdle}`}
+                    disabled={alreadyDeployed}
+                    title={
+                      alreadyDeployed
+                        ? `${env.label} is already bootstrapped on ${cluster}`
+                        : undefined
+                    }
+                    onClick={() => !alreadyDeployed && toggleEnv(env.value)}
+                    className={`${pillBase} ${
+                      alreadyDeployed
+                        ? pillDisabled
+                        : active
+                          ? pillActive
+                          : pillIdle
+                    }`}
                   >
                     {env.label}
+                    {alreadyDeployed && (
+                      <span className="ml-1.5 text-[10px] text-muted-foreground">
+                        (deployed)
+                      </span>
+                    )}
                     <span className="ml-1.5 rounded bg-muted px-1 font-mono text-[10px]">
                       {env.tag}
                     </span>
@@ -692,6 +1085,14 @@ export function DeploymentForm({ onSubmitted }: DeploymentFormProps = {}) {
 
         {/* ── Env vars card ── */}
         <div className="rounded-2xl border bg-card p-5">
+          {isScaledJob && (
+            <div className="mb-3 flex gap-2 rounded-xl border border-blue-300 bg-blue-50 px-3 py-2 text-xs text-blue-800 dark:border-blue-900/50 dark:bg-blue-900/20 dark:text-blue-300">
+              <AlertTriangle className="mt-0.5 h-3.5 w-3.5 flex-shrink-0" />
+              <span>
+                These env vars become the L3 component <code className="rounded bg-blue-100 px-1 font-mono dark:bg-blue-900/40">config.properties</code> — copied verbatim into every component (article, section, ...) since the worker matrix shares the same Redis / BASE_URL / PROXY_URI baseline. Per-worker overrides go in <code className="rounded bg-blue-100 px-1 font-mono dark:bg-blue-900/40">devops/workers.yml</code>.
+              </span>
+            </div>
+          )}
           {isFrontend && (
             <label className="mb-3 flex items-center gap-2 text-sm font-medium">
               <input
@@ -710,12 +1111,7 @@ export function DeploymentForm({ onSubmitted }: DeploymentFormProps = {}) {
             </label>
           )}
 
-          {isMultiWorker ? (
-            <EmptyEnvCard
-              title="Env vars live in workers.yaml"
-              body="Multi-worker apps ship env defaults in their repo. This form just records the deployment shell."
-            />
-          ) : isFrontend && !showFrontendEnv ? (
+          {isFrontend && !showFrontendEnv ? (
             <EmptyEnvCard
               title="Frontend apps don't need env vars"
               body="Tick the box above only if your Next.js server-side routes need runtime vars at start-up."
@@ -807,11 +1203,15 @@ export function DeploymentForm({ onSubmitted }: DeploymentFormProps = {}) {
         </div>
         <button
           type="submit"
-          disabled={loading || envsDisabled}
+          disabled={loading || envsDisabled || repoBlockReason !== null || inspecting}
           className="inline-flex items-center gap-2 rounded-xl bg-[#1a1a1a] px-5 py-2 text-sm font-medium text-white shadow-sm transition-colors hover:bg-[#2d1b0e] disabled:opacity-50 dark:bg-[#164e63] dark:hover:bg-[#0c2d3f]"
         >
           <Rocket className="h-4 w-4" />
-          {loading ? "Submitting…" : "Submit request"}
+          {loading
+            ? "Submitting…"
+            : inspecting
+              ? "Checking repo…"
+              : "Submit request"}
         </button>
       </div>
     </form>
@@ -863,7 +1263,7 @@ function PillRow({
 
 function EmptyEnvCard({ title, body }: { title: string; body: string }) {
   return (
-    <div className="flex h-full flex-col items-start justify-center gap-1 rounded-xl border border-dashed bg-muted/30 px-4 py-8 text-sm">
+    <div className="flex flex-col items-start gap-1 rounded-xl border border-dashed bg-muted/30 px-4 py-5 text-sm">
       <div className="font-medium">{title}</div>
       <div className="text-xs text-muted-foreground">{body}</div>
     </div>
@@ -873,19 +1273,23 @@ function EmptyEnvCard({ title, body }: { title: string; body: string }) {
 function SuccessCard({
   submitted,
   conflictStrategy,
-  copied,
-  setCopied,
   onSubmitAnother,
 }: {
-  submitted: SubmittedDeployment;
+  submitted: SubmittedDeployment[];
   conflictStrategy: string | null;
-  copied: boolean;
-  setCopied: (b: boolean) => void;
   onSubmitAnother: () => void;
 }) {
-  const trackUrl = submitted.trackUrl ?? "";
+  // SEV: backend created N records (one per env). For the dev's tracking
+  // experience we surface only ONE URL — the first record's token — and
+  // the track page expands to show all sibling envs under that one URL.
+  const primary = submitted[0];
+  const envs = submitted.map((r) => r.environments[0]).filter(Boolean);
+  const trackUrl = primary.trackUrl ?? "";
   const fullTrackUrl =
-    typeof window !== "undefined" ? `${window.location.origin}${trackUrl}` : trackUrl;
+    typeof window !== "undefined"
+      ? `${window.location.origin}${trackUrl}`
+      : trackUrl;
+  const [copied, setCopied] = useState(false);
 
   return (
     <div className="mx-auto max-w-2xl space-y-4 rounded-2xl border border-emerald-200 bg-emerald-50 p-6 shadow-sm dark:border-emerald-900/50 dark:bg-emerald-900/20">
@@ -898,15 +1302,15 @@ function SuccessCard({
             Request submitted
           </h2>
           <p className="text-sm text-emerald-800/80 dark:text-emerald-300/80">
-            <span className="font-mono">{submitted.repoSlug}</span> · {submitted.cluster} · {submitted.environments.join(" + ")}
+            <span className="font-mono">{primary.repoSlug}</span> · {primary.cluster} · {envs.join(" + ")}
           </p>
         </div>
       </div>
 
       <p className="text-sm text-emerald-900 dark:text-emerald-200">
-        <strong>Waiting for DevOps approval.</strong> Once approved, the webhook is
-        registered, bootstrap tags are pushed, and Jenkins builds the image. Manifest
-        generation runs from your <code className="rounded bg-emerald-100 px-1 font-mono text-xs dark:bg-emerald-900/40">spec.json</code>.
+        <strong>Waiting for DevOps approval{submitted.length > 1 ? " for each env" : ""}.</strong>{" "}
+        Each env is an independent record under the hood — no shared status
+        field, no aggregate races. The link below shows them all in one view.
       </p>
 
       {conflictStrategy === "delete_and_repush" && (
