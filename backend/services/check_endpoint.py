@@ -1,9 +1,16 @@
 import httpx
 
 from models.endpoint import Endpoint
+from services.check_db import PROBES as _DB_PROBES
 
 
 async def check_endpoint(endpoint: Endpoint) -> dict:
+    # DB endpoints route to protocol-specific probes. Same return shape
+    # as the HTTP path, so notification + alert flow stays uniform.
+    kind = getattr(endpoint, "kind", "http") or "http"
+    if kind in _DB_PROBES:
+        return await _DB_PROBES[kind](endpoint)
+
     start = 0
     try:
         headers = dict(endpoint.headers) if endpoint.headers else {}

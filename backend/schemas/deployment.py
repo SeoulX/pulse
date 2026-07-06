@@ -48,6 +48,24 @@ class CreateDeploymentRequest(BaseModel):
     hpa: Dict[str, Any] = Field(default_factory=dict)
 
 
+class AddWorkerRequest(BaseModel):
+    """Submit payload for adding a worker to an existing scraper.
+
+    Creates a DeploymentRequest with kind="add_worker"; admin approval
+    triggers the workers.yml patch + alpha tag push. Staging-only on
+    the approval side per the agreed MVP scope.
+    """
+    repo_url: str
+    requested_by: EmailStr
+    component: str          # existing component in devops/workers.yml
+    worker: str             # NEW worker name (uppercase per workers schema)
+    max_replicas: Optional[int] = Field(default=None, ge=1, le=500, alias="max")
+    batch: Optional[int] = Field(default=None, ge=1, le=10000)
+    list_name: Optional[str] = Field(default=None, alias="listName")
+
+    model_config = {"populate_by_name": True}
+
+
 class RejectDeploymentRequest(BaseModel):
     reason: Optional[str] = None
 

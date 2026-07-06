@@ -29,6 +29,16 @@ interface DiscoverResult {
 
 const HTTP_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"];
 
+// Probe kinds. `http` keeps the existing URL/method/body flow.
+// DB kinds repurpose the URL field as a connection string and skip
+// the method/body/expected-status section.
+const PROBE_KINDS: Array<{ value: string; label: string; hint: string }> = [
+  { value: "http",          label: "HTTP",          hint: "GET/POST against a URL — the existing flow." },
+  { value: "mongo",         label: "MongoDB",       hint: "URL = mongodb:// connection string. Probe runs `ping`." },
+  { value: "elasticsearch", label: "Elasticsearch", hint: "URL = http(s)://host:9200. Probe reads /_cluster/health (green/yellow/red → UP/DEGRADED/DOWN)." },
+  { value: "postgres",      label: "Postgres",      hint: "URL = postgresql:// connection string. Probe runs `SELECT 1`." },
+];
+
 const inputClass =
   "w-full rounded-xl border bg-background px-4 py-2.5 text-sm outline-none transition-all focus:border-[#e8871e] focus:ring-2 focus:ring-[#e8871e]/20 dark:focus:border-[#2a7f9e] dark:focus:ring-[#2a7f9e]/20";
 
@@ -64,6 +74,7 @@ export function EndpointForm({
   const [form, setForm] = useState({
     projectId: (initialData?.projectId as string) || "",
     name: (initialData?.name as string) || "",
+    kind: (initialData?.kind as string) || "http",
     url: (initialData?.url as string) || "",
     method: (initialData?.method as string) || "GET",
     expectedStatusCode: (initialData?.expectedStatusCode as number) || 200,
@@ -302,17 +313,47 @@ export function EndpointForm({
         </div>
 
         <div>
-          <label className="mb-1 block text-sm font-medium">URL</label>
+          <label className="mb-1 block text-sm font-medium">Probe kind</label>
+          <select
+            value={form.kind}
+            onChange={(e) => setForm({ ...form, kind: e.target.value })}
+            className={inputClass}
+          >
+            {PROBE_KINDS.map((k) => (
+              <option key={k.value} value={k.value}>
+                {k.label}
+              </option>
+            ))}
+          </select>
+          <p className="mt-1 text-xs text-muted-foreground">
+            {PROBE_KINDS.find((k) => k.value === form.kind)?.hint}
+          </p>
+        </div>
+
+        <div>
+          <label className="mb-1 block text-sm font-medium">
+            {form.kind === "http" ? "URL" : "Connection string"}
+          </label>
           <input
-            type="url"
+            type={form.kind === "http" ? "url" : "text"}
             required
             value={form.url}
             onChange={(e) => setForm({ ...form, url: e.target.value })}
-            className={inputClass}
-            placeholder="https://api.example.com/health"
+            className={`${inputClass} ${form.kind === "http" ? "" : "font-mono text-xs"}`}
+            placeholder={
+              form.kind === "mongo"
+                ? "mongodb+srv://user:pass@host/?replicaSet=..."
+                : form.kind === "postgres"
+                  ? "postgresql://user:pass@host:5432/db"
+                  : form.kind === "elasticsearch"
+                    ? "http://elastic:pass@host:9200"
+                    : "https://api.example.com/health"
+            }
           />
         </div>
 
+        {/* HTTP-only fields. DB probes skip method/body/expected-status. */}
+        {form.kind === "http" && (
         <div className="grid grid-cols-2 gap-4">
           <div>
             <label className="mb-1 block text-sm font-medium">Method</label>
@@ -346,6 +387,7 @@ export function EndpointForm({
             />
           </div>
         </div>
+        )}
 
         <div className="grid grid-cols-2 gap-4">
           <div>

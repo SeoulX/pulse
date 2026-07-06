@@ -6,9 +6,19 @@ services:
     env_file:
       - ./backend/.env
     extra_hosts:
+      # Legacy Atlas — kept until we wipe references; harmless if unused.
       - "cluster0-shard-00-00.7mbnl.mongodb.net:159.143.173.101"
       - "cluster0-shard-00-01.7mbnl.mongodb.net:159.143.173.140"
       - "cluster0-shard-00-02.7mbnl.mongodb.net:159.143.173.124"
+      # On-prem Mongo replica set (kl-1). Same set Pulse stores its
+      # own metadata in AND the one the Databases page monitors.
+      # Arbiter points at the primary IP because it accepts probes but
+      # isn't a real data member; pymongo just needs a name resolution.
+      - "mongodb1:192.168.10.10"
+      - "mongodb2:192.168.10.11"
+      - "mongodb3:192.168.10.12"
+      - "mongodb4:192.168.10.13"
+      - "arbiter:192.168.10.10"
     restart: unless-stopped
 
   frontend:

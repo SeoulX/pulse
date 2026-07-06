@@ -31,6 +31,13 @@ class Notifications(BaseModel):
 class Endpoint(Document):
     project_id: Optional[PydanticObjectId] = Field(default=None, alias="projectId")
     name: str
+    # Probe kind. `http` (default) uses the existing httpx flow.
+    # `mongo`/`elasticsearch`/`postgres` dispatch to services/check_db.py
+    # for a protocol-level connectivity check. URL field carries the
+    # connection string in that case (mongodb://..., http://es..:9200,
+    # postgresql://...). Existing endpoints without this field default
+    # to "http" — back-compat preserved.
+    kind: Literal["http", "mongo", "elasticsearch", "postgres", "redis"] = "http"
     url: str
     method: Literal["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"] = "GET"
     expected_status_code: int = Field(default=200, alias="expectedStatusCode")

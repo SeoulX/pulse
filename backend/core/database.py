@@ -8,7 +8,7 @@ client: AsyncIOMotorClient = None  # type: ignore
 
 async def init_db():
     global client
-    client = AsyncIOMotorClient(settings.MONGODB_URI)
+    client = AsyncIOMotorClient(settings.PULSE_DB_URI)
     db = client[settings.DB_NAME]
 
     from models.user import User
@@ -17,10 +17,12 @@ async def init_db():
     from models.check_result import CheckResult
     from models.notification import Notification
     from models.deployment import DeploymentRequest
+    from models.deployment_event import DeploymentEvent
+    from models.db_metric_sample import DbMetricSample
 
     await init_beanie(
         database=db,
-        document_models=[User, Project, Endpoint, CheckResult, Notification, DeploymentRequest],
+        document_models=[User, Project, Endpoint, CheckResult, Notification, DeploymentRequest, DeploymentEvent, DbMetricSample],
     )
 
 

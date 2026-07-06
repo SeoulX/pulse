@@ -71,10 +71,42 @@ class DeploymentRequest(Document):
     # Phase 2 will plumb this through to the manifest generator. None for
     # non-ScaledJob workloads or repos that don't have a workers.yml.
     workers: Optional[Dict[str, Any]] = Field(default=None)
+    # Monorepo / polyworkload spec (devops/components.yml). Snapshotted at
+    # submit time so the deploy is reproducible even if the dev edits
+    # components.yml between submit and approve. Generator branches on
+    # `image_target`:
+    #   per-component → fan out to N flat manifest trees (Pattern A)
+    #   shared        → emit N subtrees under one app (Pattern B, partial)
+    # None when the repo has no components.yml.
+    components: Optional[List[Dict[str, Any]]] = Field(default=None)
+    image_target: Optional[str] = Field(default=None, alias="imageTarget")
     # Public ingress + TLS cert opt-out. None means "let the role decide
     # at generate-manifests.sh time" (the historical default). True/False
     # force the spec.needsIngress flag explicitly.
     needs_ingress: Optional[bool] = Field(default=None, alias="needsIngress")
+
+    # Retry / build tracking. `attempt` is the count of Jenkins claims for
+    # this env record (1 on first dispatch, ++ on every retry). `latest_*`
+    # snapshot the most-recent run so the tracker page has O(1) access
+    # without joining deployment_events. Full history lives in that
+    # collection.
+    attempt: int = 1
+    latest_job_id: Optional[str] = None
+    latest_build_id: Optional[str] = None
+
+    # Request type. `new` (default) = the normal new-app submission flow.
+    # `add_worker` = a follow-up request that appends a worker to an
+    # existing scraper's devops/workers.yml + retags an alpha. Keeps
+    # everything in one collection so the same tracker + Discord +
+    # approval path covers both.
+    kind: str = Field(default="new")
+    # Set when kind="add_worker": {component, worker, max, batch, list_name?}.
+    # None for kind="new". Approve flow reads this to patch workers.yml
+    # and push the next alpha tag.
+    add_worker_spec: Optional[Dict[str, Any]] = Field(
+        default=None, alias="addWorkerSpec"
+    )
+
     created_at: datetime = Field(
         default_factory=lambda: datetime.now(timezone.utc), alias="createdAt"
     )

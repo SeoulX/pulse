@@ -1,5 +1,6 @@
 import asyncio
 import re
+from typing import Optional
 
 import httpx
 
@@ -128,17 +129,75 @@ async def get_default_branch(client: httpx.AsyncClient, repo_slug: str) -> str:
     return resp.json().get("mainbranch", {}).get("name", "main")
 
 
-async def push_tag(repo_slug: str, tag_name: str) -> dict:
-    """Create a lightweight tag on the repo's default branch HEAD."""
+async def get_branch_head(client: httpx.AsyncClient, repo_slug: str, branch: str) -> Optional[str]:
+    """Resolve a branch name to its current commit hash. None if branch missing."""
+    resp = await _retry_request(
+        client, "GET", _api(f"{repo_slug}/refs/branches/{branch}")
+    )
+    if resp.status_code != 200:
+        return None
+    return resp.json().get("target", {}).get("hash")
+
+
+async def create_branch(repo_slug: str, name: str, from_branch: Optional[str] = None) -> dict:
+    """Create a new branch from `from_branch` HEAD (defaults to repo's
+    default branch). Idempotent — returns {"skipped": True} when the
+    branch already exists, so callers can call unconditionally during
+    bootstrap.
+
+    Devs at this org keep `staging` + `main`/`master` per repo; Pulse
+    auto-creates `staging` from default when it's missing so the
+    tag-from-branch flow always has somewhere to cut from.
+    """
     async with httpx.AsyncClient(auth=_auth(), timeout=15) as client:
-        # Check if tag already exists
+        # Already exists? short-circuit.
+        existing = await get_branch_head(client, repo_slug, name)
+        if existing:
+            return {"skipped": True, "branch": name, "head": existing}
+
+        source = from_branch or await get_default_branch(client, repo_slug)
+        head = await get_branch_head(client, repo_slug, source)
+        if not head:
+            raise RuntimeError(
+                f"can't create branch '{name}' — source branch '{source}' missing on {repo_slug}"
+            )
+        resp = await _retry_request(
+            client, "POST", _api(f"{repo_slug}/refs/branches"),
+            json={"name": name, "target": {"hash": head}},
+        )
+        if resp.status_code >= 400:
+            raise RuntimeError(f"create_branch failed: HTTP {resp.status_code} {resp.text[:200]}")
+        return {"created": True, "branch": name, "from": source, "head": head}
+
+
+async def push_tag(repo_slug: str, tag_name: str, from_branch: Optional[str] = None) -> dict:
+    """Create a lightweight tag at the HEAD of `from_branch` (or the
+    repo's default branch when None).
+
+    Per-env tagging: staging deploys tag the `staging` branch HEAD,
+    production deploys tag `main`/`master`. Keeps the tag pinned to
+    the code the dev actually wanted to ship from that branch instead
+    of always cutting from default.
+    """
+    async with httpx.AsyncClient(auth=_auth(), timeout=15) as client:
+        # Check if tag already exists.
         resp = await _retry_request(
             client, "GET", _api(f"{repo_slug}/refs/tags/{tag_name}")
         )
         if resp.status_code == 200:
             return {"skipped": True, "message": f"Tag {tag_name} already exists"}
 
-        branch = await get_default_branch(client, repo_slug)
+        branch = from_branch or await get_default_branch(client, repo_slug)
+        # Resolve to a real commit hash. Bitbucket's tag endpoint
+        # accepts branch names as `target.hash` (auto-resolves), but
+        # we resolve up-front to surface a clear error when the branch
+        # is missing rather than getting a confusing 400 from the tag
+        # create call.
+        head = await get_branch_head(client, repo_slug, branch)
+        if not head:
+            raise RuntimeError(
+                f"can't push tag '{tag_name}' — branch '{branch}' missing on {repo_slug}"
+            )
 
         resp = await _retry_request(
             client,
@@ -146,11 +205,11 @@ async def push_tag(repo_slug: str, tag_name: str) -> dict:
             _api(f"{repo_slug}/refs/tags"),
             json={
                 "name": tag_name,
-                "target": {"hash": branch},
+                "target": {"hash": head},
             },
         )
         resp.raise_for_status()
-        return {"created": True, "tag": tag_name}
+        return {"created": True, "tag": tag_name, "branch": branch, "head": head}
 
 
 async def delete_tag(repo_slug: str, tag_name: str) -> dict:
@@ -195,11 +254,134 @@ _CLUSTERS_TO_SCAN = ("kl-1", "kl-2")
 _ENVS_TO_SCAN = ("staging", "production")
 
 # Any of these in package.json deps/devDeps marks the repo as a UI workload.
-# Order doesn't matter — the regex matches the first one present.
+# Order matters here — the FIRST match wins, so list specific frameworks
+# (next, gatsby, nuxt) ahead of generic builders (vite) ahead of libraries
+# (react-scripts), and ahead of view-layer libs (vue, svelte, preact,
+# solid-js) which can otherwise shadow the actual framework. We capture
+# the matched name and reuse it as `inferred_framework`.
 _UI_FRAMEWORK_RE = re.compile(
-    r'"(next|vite|react-scripts|gatsby|@angular/core|vue|svelte|astro|nuxt|'
-    r'@remix-run/react|preact|solid-js)"\s*:'
+    r'"(next|nuxt|gatsby|@remix-run/react|astro|@angular/core|'
+    r'react-scripts|vite|svelte|vue|preact|solid-js)"\s*:'
 )
+
+# Build-output dir + dev/preview port per framework. The deployment
+# pipeline uses these to pick the right Dockerfile template + Service
+# port. For Next we override based on render_mode (see below).
+_FRAMEWORK_DEFAULTS = {
+    "next":           {"build_dir": ".next/standalone",   "port": 3000},
+    "nuxt":           {"build_dir": ".output",            "port": 3000},
+    "gatsby":         {"build_dir": "public",             "port": 80},
+    "@remix-run/react": {"build_dir": "build",            "port": 3000},
+    "astro":          {"build_dir": "dist",               "port": 80},
+    "@angular/core":  {"build_dir": "dist",               "port": 80},
+    "react-scripts":  {"build_dir": "build",              "port": 80},
+    "vite":           {"build_dir": "dist",               "port": 80},
+    "svelte":         {"build_dir": "build",              "port": 80},
+    "vue":            {"build_dir": "dist",               "port": 80},
+    "preact":         {"build_dir": "dist",               "port": 80},
+    "solid-js":       {"build_dir": "dist",               "port": 80},
+    "static":         {"build_dir": "public",             "port": 80},
+}
+
+# Env-var prefix required by each framework's bundler to expose values to
+# client-side code. Pasting `API_URL=foo` for a Vite app silently strips
+# it at build time — surfacing the right prefix in the form prevents this
+# mystery-bug class entirely.
+_FRAMEWORK_ENV_PREFIX = {
+    "next":             "NEXT_PUBLIC_",
+    "nuxt":             "NUXT_PUBLIC_",
+    "vite":             "VITE_",
+    "react-scripts":    "REACT_APP_",
+    "gatsby":           "GATSBY_",
+    "astro":            "PUBLIC_",
+    "@remix-run/react": None,        # SSR — full process.env available
+    "@angular/core":    None,        # built into environments.ts at compile time
+    "svelte":           "VITE_",     # SvelteKit/Vite
+    "vue":              "VITE_",
+    "preact":           "VITE_",
+    "solid-js":         "VITE_",
+    "static":           None,
+}
+
+
+def _derive_ui_signals(
+    pkg: str | None,
+    next_config: str | None,
+    *,
+    has_pnpm: bool,
+    has_yarn: bool,
+    has_npm: bool,
+    has_bun: bool,
+    static_only: bool = False,
+) -> dict:
+    """Compute fine-grained UI deployment signals.
+
+    Returns the dict slice to merge into `_detect_workload`'s result.
+    Caller is responsible for the workload/role/team fields.
+
+    static_only=True is for the `public/index.html` plain-HTML fallback
+    where there's no framework — we still surface the static-nginx
+    defaults so the form can pre-fill port 80 / no env-prefix.
+    """
+    if static_only:
+        defaults = _FRAMEWORK_DEFAULTS["static"]
+        return {
+            "inferred_framework": "static",
+            "inferred_render_mode": "static",
+            "inferred_package_manager": None,
+            "inferred_env_prefix": None,
+            "inferred_default_port": defaults["port"],
+            "inferred_build_output": defaults["build_dir"],
+        }
+
+    framework = None
+    if pkg:
+        m = _UI_FRAMEWORK_RE.search(pkg)
+        if m:
+            framework = m.group(1)
+
+    # Package manager: lockfile presence — preference order matches what
+    # the Dockerfile build template should respect (pnpm > yarn > npm > bun
+    # is by lockfile reliability, not popularity).
+    if has_pnpm:   pkg_mgr = "pnpm"
+    elif has_yarn: pkg_mgr = "yarn"
+    elif has_npm:  pkg_mgr = "npm"
+    elif has_bun:  pkg_mgr = "bun"
+    else:          pkg_mgr = None
+
+    # Next.js render mode: 'export' → static HTML in out/, 'standalone' →
+    # minimal SSR server in .next/standalone/, neither → default SSR. Only
+    # meaningful for Next today; other frameworks default to their nature.
+    render_mode = None
+    if framework == "next":
+        if next_config and re.search(r"output\s*:\s*['\"]export['\"]", next_config):
+            render_mode = "static"
+        elif next_config and re.search(r"output\s*:\s*['\"]standalone['\"]", next_config):
+            render_mode = "ssr-standalone"
+        else:
+            render_mode = "ssr-default"
+    elif framework in ("nuxt", "@remix-run/react"):
+        render_mode = "ssr-default"
+    elif framework:
+        render_mode = "static"
+
+    defaults = _FRAMEWORK_DEFAULTS.get(framework or "static", _FRAMEWORK_DEFAULTS["static"])
+    build_dir = defaults["build_dir"]
+    port = defaults["port"]
+    # For Next.js with output:'export', it's actually static HTML in out/
+    # served by nginx on port 80 — flip from the SSR defaults.
+    if framework == "next" and render_mode == "static":
+        build_dir = "out"
+        port = 80
+
+    return {
+        "inferred_framework": framework,
+        "inferred_render_mode": render_mode,
+        "inferred_package_manager": pkg_mgr,
+        "inferred_env_prefix": _FRAMEWORK_ENV_PREFIX.get(framework or "static"),
+        "inferred_default_port": port,
+        "inferred_build_output": build_dir,
+    }
 
 
 async def _detect_workload(
@@ -234,13 +416,28 @@ async def _detect_workload(
         )
         return r.status_code == 200
 
-    pkg, reqs, pyproject, workers_root, workers_devops, has_static_index = await asyncio.gather(
+    (
+        pkg, reqs, pyproject, workers_root, workers_devops, has_static_index,
+        nx_js, nx_mjs, nx_ts,
+        has_pnpm, has_yarn, has_npm, has_bun,
+    ) = await asyncio.gather(
         fetch("package.json"),
         fetch("requirements.txt"),
         fetch("pyproject.toml"),
         fetch("workers.yaml"),
         fetch("devops/workers.yml"),
         exists("public/index.html"),
+        # Next.js config can land in any of 3 extensions — fetch all in
+        # parallel and use whichever 200s. Cost: 2 extra HEADs on non-Next
+        # repos, runs in the same gather() pass so no added latency.
+        fetch("next.config.js"),
+        fetch("next.config.mjs"),
+        fetch("next.config.ts"),
+        # Lockfile presence drives package-manager inference.
+        exists("pnpm-lock.yaml"),
+        exists("yarn.lock"),
+        exists("package-lock.json"),
+        exists("bun.lockb"),
         return_exceptions=True,
     )
     pkg = pkg if isinstance(pkg, str) else None
@@ -249,6 +446,14 @@ async def _detect_workload(
     workers_root = workers_root if isinstance(workers_root, str) else None
     workers_devops = workers_devops if isinstance(workers_devops, str) else None
     has_static_index = has_static_index is True
+    next_config = next(
+        (c for c in (nx_js, nx_mjs, nx_ts) if isinstance(c, str)),
+        None,
+    )
+    has_pnpm = has_pnpm is True
+    has_yarn = has_yarn is True
+    has_npm = has_npm is True
+    has_bun = has_bun is True
 
     # Either workers.yaml (legacy v1) or devops/workers.yml (v2 spec)
     # indicates a multi-worker ScaledJob layout.
@@ -269,6 +474,11 @@ async def _detect_workload(
             "inferred_workload_kind": "Deployment",
             "inferred_role": "UI",
             "inferred_team": "Frontend",
+            **_derive_ui_signals(
+                pkg, next_config,
+                has_pnpm=has_pnpm, has_yarn=has_yarn,
+                has_npm=has_npm, has_bun=has_bun,
+            ),
         }
     has_fastapi = (
         (reqs and re.search(r"^\s*fastapi", reqs, re.MULTILINE | re.IGNORECASE))
@@ -288,6 +498,12 @@ async def _detect_workload(
             "inferred_workload_kind": "Deployment",
             "inferred_role": "UI",
             "inferred_team": "Frontend",
+            **_derive_ui_signals(
+                None, None,
+                has_pnpm=False, has_yarn=False,
+                has_npm=False, has_bun=False,
+                static_only=True,
+            ),
         }
     return {}
 
@@ -354,6 +570,7 @@ async def inspect_repo(repo_slug: str) -> dict:
         "has_dockerfile_prod": "devops/Dockerfile.prod",
         "has_jenkinsfile": "Jenkinsfile",
         "has_workers_yml": "devops/workers.yml",
+        "has_components_yml": "devops/components.yml",
     }
     result: dict = {
         "slug": repo_slug,
@@ -362,11 +579,31 @@ async def inspect_repo(repo_slug: str) -> dict:
         "inferred_workload_kind": None,
         "inferred_role": None,
         "inferred_team": None,
+        # UI-specific signals — present on every response (None when the
+        # repo isn't a UI) so the form can rely on key existence.
+        "inferred_framework": None,
+        "inferred_render_mode": None,
+        "inferred_package_manager": None,
+        "inferred_env_prefix": None,
+        "inferred_default_port": None,
+        "inferred_build_output": None,
         # When devops/workers.yml exists, the inspect endpoint surfaces a
         # short summary (component+worker counts) so the form can preview
         # the ScaledJob layout before the dev submits. Full validation
         # happens on submit; this is a presence + counts hint only.
         "workers_summary": None,
+        # Same idea for devops/components.yml — surfaces the monorepo /
+        # polyworkload spec so the form can preview the multi-workload
+        # layout (Pattern A or B from schemas/components.py).
+        "components_summary": None,
+        # Branch presence — devs at this org keep `staging` + `main`/`master`;
+        # Pulse cuts tags from staging for staging deploys and from
+        # main/master for production. Surfaced here so the form can warn
+        # when a branch is missing before submit.
+        "default_branch": None,
+        "has_staging_branch": False,
+        "has_main_branch": False,
+        "has_master_branch": False,
         **{k: False for k in paths},
     }
     try:
@@ -383,6 +620,25 @@ async def inspect_repo(repo_slug: str) -> dict:
             branch = (
                 repo_resp.json().get("mainbranch", {}).get("name", "main")
             )
+            result["default_branch"] = branch
+
+            # Branch probes — one HEAD lookup each. Cheap, and the form
+            # uses these to warn when the staging branch is missing
+            # before the dev submits.
+            async def probe_branch(name: str) -> tuple[str, bool]:
+                head = await get_branch_head(client, repo_slug, name)
+                return name, head is not None
+
+            branch_results = await asyncio.gather(
+                probe_branch("staging"),
+                probe_branch("main"),
+                probe_branch("master"),
+                return_exceptions=True,
+            )
+            for entry in branch_results:
+                if isinstance(entry, tuple):
+                    name, present = entry
+                    result[f"has_{name}_branch"] = present
 
             async def check(key: str, path: str) -> tuple[str, bool]:
                 r = await _retry_request(
@@ -450,6 +706,55 @@ async def inspect_repo(repo_slug: str) -> dict:
                     # Treat any fetch/parse failure as "no summary"; submit
                     # will re-fetch and surface the real error.
                     pass
+
+            # Same shape for devops/components.yml (monorepo / polyworkload
+            # spec). Failures non-fatal — submit-time validation re-fetches.
+            if result.get("has_components_yml"):
+                try:
+                    r = await _retry_request(
+                        client, "GET",
+                        _api(f"{repo_slug}/src/{branch}/devops/components.yml"),
+                    )
+                    if r.status_code == 200:
+                        from schemas.components import (
+                            ComponentsParseError,
+                            parse_components_yaml,
+                        )
+                        try:
+                            spec = parse_components_yaml(r.text)
+                            # Group by workload_kind so the form can show
+                            # a friendly "3 Deployments + 1 CronJob + 1 StatefulSet" line.
+                            kind_counts: dict[str, int] = {}
+                            for c in spec.components:
+                                kind_counts[c.workload_kind] = kind_counts.get(c.workload_kind, 0) + 1
+                            result["components_summary"] = {
+                                "valid": True,
+                                "image_target": spec.image_target,
+                                "component_count": len(spec.components),
+                                "kind_counts": kind_counts,
+                                "components": [
+                                    {
+                                        "name":          c.name,
+                                        "role":          c.role,
+                                        "workload_kind": c.workload_kind,
+                                        "replicas":      c.replicas,
+                                        "port":          c.port,
+                                        "schedule":      c.schedule,
+                                        "subdomain":     c.subdomain,
+                                        "dockerfile":    c.dockerfile,
+                                        "command":       c.command,
+                                        "args":          c.args,
+                                    }
+                                    for c in spec.components
+                                ],
+                            }
+                        except ComponentsParseError as e:
+                            result["components_summary"] = {
+                                "valid": False,
+                                "errors": e.errors,
+                            }
+                except Exception:
+                    pass
     except Exception:
         # Bitbucket flake — leave defaults so the form can show a generic
         # banner rather than blocking on a transient outage.
@@ -468,6 +773,66 @@ async def list_tags(repo_slug: str) -> list[str]:
             return [t["name"] for t in resp.json().get("values", [])]
     except Exception:
         return []
+
+
+async def commit_file(
+    repo_slug: str,
+    file_path: str,
+    file_content: str,
+    *,
+    message: str,
+    author: Optional[str] = None,
+    branch: Optional[str] = None,
+) -> dict:
+    """Commit a single file to the repo's default branch via Bitbucket's
+    multipart `/src` endpoint. Returns {'commit': <hash>} on success.
+
+    Bitbucket's API takes the file path as a form-field NAME and the
+    file body as its value, with auxiliary fields (`message`, `branch`,
+    `author`) alongside. Done as multipart so binary content is safe.
+    """
+    auth_user = settings.BITBUCKET_USER
+    auth_pass = settings.BITBUCKET_APP_PASSWORD
+    if not (auth_user and auth_pass):
+        raise RuntimeError("BITBUCKET_USER / BITBUCKET_APP_PASSWORD not configured")
+
+    async with httpx.AsyncClient(auth=_auth(), timeout=30) as client:
+        target_branch = branch or await get_default_branch(client, repo_slug)
+
+        # httpx multipart: pass `files=` for the file content + `data=` for fields.
+        files = {file_path: (file_path, file_content.encode("utf-8"), "text/plain")}
+        data = {"message": message, "branch": target_branch}
+        if author:
+            data["author"] = author
+
+        resp = await _retry_request(
+            client, "POST", _api(f"{repo_slug}/src"),
+            files=files, data=data,
+        )
+        if resp.status_code >= 400:
+            raise RuntimeError(f"commit_file failed: HTTP {resp.status_code} {resp.text[:300]}")
+        # Bitbucket returns the new commit hash in the `Location` header for 201.
+        loc = resp.headers.get("Location", "")
+        commit_hash = loc.rsplit("/", 1)[-1] if loc else ""
+        return {"commit": commit_hash, "branch": target_branch}
+
+
+def next_alpha_tag(existing: list[str]) -> str:
+    """Pick the next `vX.Y.Z-alpha` tag based on the highest existing
+    alpha. Bumps the patch number. Falls back to `v0.0.1-alpha` when no
+    alpha tags exist (we never use v0.0.0-alpha for ongoing work — it's
+    reserved for bootstrap)."""
+    best: tuple[int, int, int] | None = None
+    for t in existing:
+        m = re.match(r"^v(\d+)\.(\d+)\.(\d+)-alpha$", t)
+        if not m:
+            continue
+        triple = (int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        if best is None or triple > best:
+            best = triple
+    if best is None:
+        return "v0.0.1-alpha"
+    return f"v{best[0]}.{best[1]}.{best[2] + 1}-alpha"
 
 
 def classify_tags(existing: list[str]) -> dict:

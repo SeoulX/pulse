@@ -27,6 +27,10 @@ class NotificationsSchema(BaseModel):
 class CreateEndpointRequest(BaseModel):
     project_id: Optional[str] = None
     name: str
+    # Probe kind. `http` keeps existing flow. `mongo`/`elasticsearch`/`postgres`
+    # route to protocol-specific probes; `url` then carries the
+    # connection string instead of an HTTP URL.
+    kind: Literal["http", "mongo", "elasticsearch", "postgres", "redis"] = "http"
     url: str
     method: Literal["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"] = "GET"
     expected_status_code: int = 200
@@ -43,6 +47,7 @@ class CreateEndpointRequest(BaseModel):
 class UpdateEndpointRequest(BaseModel):
     project_id: Optional[str] = None
     name: Optional[str] = None
+    kind: Optional[Literal["http", "mongo", "elasticsearch", "postgres", "redis"]] = None
     url: Optional[str] = None
     method: Optional[Literal["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"]] = None
     expected_status_code: Optional[int] = None

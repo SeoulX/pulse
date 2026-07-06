@@ -77,6 +77,29 @@ const ROLE_DEFAULT_PORT: Record<string, number> = {
   Worker: 8000,
 };
 
+// Keys already injected into every pod via the cluster-wide
+// `devops-global-secrets` Secret (Reflector-mirrored into every
+// namespace). Devs should NOT paste these into the env-vars textarea —
+// the secret takes precedence over the configMap and the dev's value
+// would be silently overridden. Source of truth lives in the cluster:
+//   kubectl --context <ctx> get secret -n global devops-global-secrets
+// When that key list changes, mirror the update here so the form
+// warning stays accurate.
+const GLOBAL_INJECTED_KEYS: readonly string[] = [
+  "MONGODB_URI",
+  "REDIS_NET4_URI",
+  "REDIS_KL_V4_URI",
+  "REDIS_KL_MAIN_URI",
+  "ES_SCOUP_URI",
+  "ES_V4_URI",
+  "ES_SALINA_URI",
+  "ES_VP_URI",
+  "POSTGRES_URI",
+  "MINIO_ACCESS_KEY_ID",
+  "MINIO_SECRET_ACCESS_KEY",
+  "MINIO_ENDPOINT_URL",
+];
+
 const ROLE_HINTS: Record<string, string> = {
   API: "HTTP server, service + ingress + cert + HPA.",
   UI: "Static frontend. Service + ingress, no envFrom.",
@@ -210,6 +233,7 @@ interface RepoInspection {
   has_dockerfile_prod: boolean;
   has_jenkinsfile: boolean;
   has_workers_yml: boolean;
+  has_components_yml: boolean;
   // {cluster: envs-already-bootstrapped}. Scanned across both kl-1 and
   // kl-2 so the form can warn even when the dev picks the "empty" cluster
   // unaware that the app already lives on the other.
@@ -219,9 +243,42 @@ interface RepoInspection {
   inferred_workload_kind: string | null;
   inferred_role: string | null;
   inferred_team: string | null;
+  // UI-deployment signals — sniffed from package.json + next.config + lockfiles.
+  // Drive port auto-fill, env-prefix validation, and the Dockerfile-template
+  // hint banner. All null when the repo isn't a UI workload.
+  inferred_framework: string | null;          // next | vite | react-scripts | gatsby | ...
+  inferred_render_mode: string | null;        // static | ssr-default | ssr-standalone
+  inferred_package_manager: string | null;    // npm | yarn | pnpm | bun
+  inferred_env_prefix: string | null;         // NEXT_PUBLIC_ | VITE_ | REACT_APP_ | ...
+  inferred_default_port: number | null;       // 80 (nginx) / 3000 (SSR) / 4173 (vite preview)
+  inferred_build_output: string | null;       // .next/standalone | out | dist | build | public
   // Present when devops/workers.yml exists. Parsed at inspect time so the
   // form can show the dev exactly what was found before they hit submit.
   workers_summary: WorkersSummary | null;
+  // Present when devops/components.yml exists (monorepo / polyworkload).
+  // Mirrors workers_summary shape; surfaces the multi-kind layout for
+  // pre-submit preview.
+  components_summary: ComponentsSummary | null;
+}
+
+interface ComponentsSummary {
+  valid: boolean;
+  image_target?: "per-component" | "shared";
+  component_count?: number;
+  kind_counts?: Record<string, number>;
+  components?: Array<{
+    name: string;
+    role: string;
+    workload_kind: string;
+    replicas: number;
+    port: number;
+    schedule: string | null;
+    subdomain: string | null;
+    dockerfile: string | null;
+    command: string[] | null;
+    args: string[] | null;
+  }>;
+  errors?: string[];
 }
 
 interface DeploymentFormProps {
@@ -269,6 +326,11 @@ export function DeploymentForm({ onSubmitted }: DeploymentFormProps = {}) {
   const [lastConflictStrategy, setLastConflictStrategy] = useState<
     string | null
   >(null);
+  // Bump-on-click trigger for the "Refresh" button next to the repo
+  // URL — re-runs inspect without a full page reload. Dev pushes
+  // devops/components.yml + clicks refresh to flip the amber banner
+  // to green.
+  const [refreshTick, setRefreshTick] = useState(0);
   const [repoInspection, setRepoInspection] = useState<RepoInspection | null>(
     null
   );
@@ -314,11 +376,21 @@ export function DeploymentForm({ onSubmitted }: DeploymentFormProps = {}) {
     if (!isFrontend) setShowFrontendEnv(false);
   }, [isFrontend]);
 
-  // Default container port from the role unless dev overrode it.
+  // Default container port from the inspect signal when available (Next.js
+  // SSR needs 3000, not the role's default 80), else from the role.
+  // Inspect-driven default is the more accurate signal — for UIs especially,
+  // since the role doesn't distinguish nginx-static from Node-SSR. Falls
+  // back to the role default when the inspect didn't return a port (e.g.
+  // non-UI workloads).
   useEffect(() => {
+    const inferred = repoInspection?.inferred_default_port;
+    if (typeof inferred === "number" && inferred > 0) {
+      setPort(inferred);
+      return;
+    }
     const portDef = ROLE_DEFAULT_PORT[role];
     if (portDef) setPort(portDef);
-  }, [role]);
+  }, [role, repoInspection?.inferred_default_port]);
 
   // Default needsIngress from the role — API/UI/Streamlit get true, Worker
   // gets false (no public HTTP path). Skip once the user has toggled the
@@ -384,7 +456,7 @@ export function DeploymentForm({ onSubmitted }: DeploymentFormProps = {}) {
       cancelled = true;
       clearTimeout(timer);
     };
-  }, [inspectSlug.slug, inspectSlug.valid]);
+  }, [inspectSlug.slug, inspectSlug.valid, refreshTick]);
 
   const toggleEnv = (env: Environment) => {
     setEnvironments((prev) =>
@@ -416,6 +488,18 @@ export function DeploymentForm({ onSubmitted }: DeploymentFormProps = {}) {
     return missing.length
       ? `Repo is missing: ${missing.join(", ")}.`
       : null;
+  })();
+
+  // Pulse-align REQUIRED (2026-06-16). Every Pulse-managed repo must
+  // declare devops/components.yml (or devops/workers.yml for ScaledJob
+  // multi-worker repos). Without one, the polyworkload generator
+  // doesn't fire + the form has no workload shape to read. Block
+  // submit until the dev runs /pulse-align, commits, and pushes.
+  const specBlockReason: string | null = (() => {
+    if (!repoInspection || repoInspection.has_jenkinsfile) return null;
+    if (!repoInspection.exists) return null; // covered by repoBlockReason
+    if (repoInspection.has_components_yml || repoInspection.has_workers_yml) return null;
+    return "Repo needs devops/components.yml — run /pulse-align in the repo.";
   })();
 
   // Find the cluster the repo is already bootstrapped on (if any). We lock
@@ -719,6 +803,122 @@ export function DeploymentForm({ onSubmitted }: DeploymentFormProps = {}) {
         )
       )}
 
+      {/* Monorepo / polyworkload: surface devops/components.yml status.
+          Read-only preview — Phase 0 of the components.yml work. Form
+          submission still treats this as a single deployment (Phases
+          1-4 will fan out to N component records). See
+          manComm/05-14-26/MARK-monorepo-phase0.md. */}
+      {repoInspection?.has_components_yml && (
+        repoInspection.components_summary?.valid ? (
+          <div className="flex items-start gap-2 rounded-xl border border-emerald-300 bg-emerald-50 px-3 py-2 text-sm text-emerald-900 dark:border-emerald-900/50 dark:bg-emerald-900/20 dark:text-emerald-300">
+            <Check className="mt-0.5 h-4 w-4 flex-shrink-0" />
+            <div className="flex-1">
+              <div className="font-medium">
+                components.yml found —{" "}
+                {repoInspection.components_summary.component_count} components
+                ({repoInspection.components_summary.image_target === "shared" ? "shared image" : "per-component images"})
+              </div>
+              {repoInspection.components_summary.kind_counts && (
+                <div className="mt-0.5 text-xs">
+                  {Object.entries(repoInspection.components_summary.kind_counts)
+                    .map(([k, n]) => `${n} ${k}`)
+                    .join(" + ")}
+                </div>
+              )}
+              <ul className="mt-1 space-y-0.5 text-xs">
+                {repoInspection.components_summary.components?.map((c) => (
+                  <li key={c.name}>
+                    <span className="font-mono">{c.name}</span>{" "}
+                    <span className="text-[10px] uppercase tracking-wide opacity-75">
+                      {c.workload_kind}/{c.role}
+                    </span>
+                    {c.replicas !== 1 && <span className="opacity-75"> · {c.replicas} replicas</span>}
+                    {c.schedule && <span className="opacity-75"> · {c.schedule}</span>}
+                    {c.port !== 80 && c.workload_kind !== "CronJob" && (
+                      <span className="opacity-75"> · :{c.port}</span>
+                    )}
+                  </li>
+                ))}
+              </ul>
+              <div className="mt-1 text-[11px] italic opacity-75">
+                Preview only — multi-component fan-out lands in a later phase. Submit treats this as a single deployment for now.
+              </div>
+            </div>
+          </div>
+        ) : (
+          <div className="flex items-start gap-2 rounded-xl border border-amber-300 bg-amber-50 px-3 py-2 text-sm text-amber-900 dark:border-amber-900/50 dark:bg-amber-900/20 dark:text-amber-300">
+            <AlertTriangle className="mt-0.5 h-4 w-4 flex-shrink-0" />
+            <div>
+              <div className="font-medium">components.yml failed validation</div>
+              {repoInspection.components_summary?.errors?.length ? (
+                <ul className="mt-0.5 space-y-0.5 text-xs font-mono">
+                  {repoInspection.components_summary.errors.map((e, i) => (
+                    <li key={i}>· {e}</li>
+                  ))}
+                </ul>
+              ) : null}
+            </div>
+          </div>
+        )
+      )}
+
+      {/* UI workloads: surface framework + render-mode + package manager so
+          the dev sees what the deployment will look like before submit.
+          The render_mode hint matters most — Next.js SSR repos need a Node
+          container (port 3000), not nginx static. */}
+      {role === "UI" && repoInspection?.inferred_framework && (
+        <div className="flex items-start gap-2 rounded-xl border border-emerald-300 bg-emerald-50 px-3 py-2 text-sm text-emerald-900 dark:border-emerald-900/50 dark:bg-emerald-900/20 dark:text-emerald-300">
+          <Check className="mt-0.5 h-4 w-4 flex-shrink-0" />
+          <div className="flex-1">
+            <div className="flex flex-wrap items-center gap-1.5">
+              <span className="font-medium">UI detected</span>
+              <span className="rounded bg-emerald-200/60 px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-wide dark:bg-emerald-900/40">
+                {repoInspection.inferred_framework}
+              </span>
+              {repoInspection.inferred_render_mode && (
+                <span className="rounded bg-emerald-200/60 px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-wide dark:bg-emerald-900/40">
+                  {repoInspection.inferred_render_mode}
+                </span>
+              )}
+              {repoInspection.inferred_package_manager && (
+                <span className="rounded bg-emerald-200/60 px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-wide dark:bg-emerald-900/40">
+                  {repoInspection.inferred_package_manager}
+                </span>
+              )}
+            </div>
+            <div className="mt-1 grid grid-cols-2 gap-x-3 gap-y-0.5 text-xs">
+              {repoInspection.inferred_default_port && (
+                <span>
+                  port: <span className="font-mono">{repoInspection.inferred_default_port}</span>
+                </span>
+              )}
+              {repoInspection.inferred_build_output && (
+                <span>
+                  build: <span className="font-mono">{repoInspection.inferred_build_output}/</span>
+                </span>
+              )}
+              {repoInspection.inferred_env_prefix && (
+                <span>
+                  env prefix: <span className="font-mono">{repoInspection.inferred_env_prefix}*</span>
+                </span>
+              )}
+            </div>
+            {repoInspection.inferred_render_mode?.startsWith("ssr") && (
+              <div className="mt-1 text-xs">
+                <strong>SSR mode:</strong> needs a Node runtime container (not
+                nginx). Dockerfile should{" "}
+                <code className="rounded bg-emerald-100 px-1 font-mono text-[11px] dark:bg-emerald-900/40">CMD ["node", "server.js"]</code>{" "}
+                and listen on{" "}
+                <span className="font-mono">
+                  {repoInspection.inferred_default_port}
+                </span>
+                .
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
       {deployedClusterEntries.length > 0 && (
         <div className="flex items-start gap-2 rounded-xl border border-blue-300 bg-blue-50 px-3 py-2 text-sm text-blue-900 dark:border-blue-900/50 dark:bg-blue-900/20 dark:text-blue-300">
           <AlertTriangle className="mt-0.5 h-4 w-4 flex-shrink-0" />
@@ -789,14 +989,33 @@ export function DeploymentForm({ onSubmitted }: DeploymentFormProps = {}) {
             )
           }
         >
-          <input
-            type="text"
-            required
-            value={repoUrl}
-            onChange={(e) => setRepoUrl(e.target.value)}
-            placeholder="my_repo or full URL"
-            className={inputAccentClass}
-          />
+          <div className="flex gap-2">
+            <input
+              type="text"
+              required
+              value={repoUrl}
+              onChange={(e) => setRepoUrl(e.target.value)}
+              placeholder="my_repo or full URL"
+              className={`${inputAccentClass} flex-1`}
+            />
+            {/* Refresh inspect without a full page reload — useful after
+                pushing devops/components.yml from a pulse-align run.
+                Disabled until a valid slug exists so the click does
+                something. */}
+            <button
+              type="button"
+              onClick={() => setRefreshTick((t) => t + 1)}
+              disabled={slugValid !== "good" || inspecting}
+              title="Re-inspect this repo (after pushing devops/components.yml)"
+              className={`flex-shrink-0 rounded-lg border px-3 py-1.5 text-xs font-medium transition-colors ${
+                slugValid === "good" && !inspecting
+                  ? "border-[#e8871e] bg-card hover:bg-muted"
+                  : "cursor-not-allowed border-border opacity-50"
+              }`}
+            >
+              {inspecting ? "Inspecting…" : "↻ Refresh"}
+            </button>
+          </div>
         </Field>
         <Field label="DNS zone">
           <select
@@ -832,78 +1051,185 @@ export function DeploymentForm({ onSubmitted }: DeploymentFormProps = {}) {
               ))}
             </PillRow>
 
-            {/* Row order: Role first (sets the suggested workload kind),
-                Kind second (auto-filled by the role / inspect; user can
-                still click any pill — no disables). */}
-            {roleVisible && (
-              <div>
-                <PillRow label="Role" lockedNote={null}>
-                  {availableRoles.map((r) => (
-                    <button
-                      key={r.value}
-                      type="button"
-                      onClick={() => setRole(r.value)}
-                      className={`${pillBase} ${
-                        role === r.value ? pillActive : pillIdle
-                      }`}
-                    >
-                      {r.label}
-                    </button>
-                  ))}
-                </PillRow>
-                {role === "API" && (
-                  <label className="mt-1.5 flex items-center gap-2 text-xs text-muted-foreground">
-                    <input
-                      type="checkbox"
-                      checked={withWorker}
-                      onChange={(e) => setWithWorker(e.target.checked)}
-                      className="h-3.5 w-3.5 rounded border-border accent-[#e8871e]"
-                    />
-                    Also ships a worker (Dockerfile.worker alongside API)
-                  </label>
-                )}
-                <p className="mt-1 text-xs italic text-muted-foreground">
-                  {ROLE_HINTS[role]}
-                </p>
-              </div>
-            )}
-
-            <PillRow
-              label="Kind"
-              lockedNote={
-                roleLocksToDeploy ? `${role} suggests Deploy` : null
-              }
-            >
-              {availableKinds.map((k) => (
-                <button
-                  key={k.value}
-                  type="button"
-                  onClick={() => setWorkloadKind(k.value)}
-                  className={`${pillBase} ${
-                    workloadKind === k.value ? pillActive : pillIdle
-                  }`}
-                >
-                  {k.label}
-                </button>
-              ))}
-            </PillRow>
-
-            {isMultiWorker && (
-              <div className="flex gap-2 rounded-xl border border-blue-300 bg-blue-50 px-3 py-2 text-xs text-blue-800 dark:border-blue-900/50 dark:bg-blue-900/20 dark:text-blue-300">
-                <AlertTriangle className="mt-0.5 h-3.5 w-3.5 flex-shrink-0" />
+            {/* Workload shape banner — always shown.
+                - Green when devops/components.yml or workers.yml present;
+                  shape comes from the repo spec.
+                - Amber when neither file present; form submits with fallback
+                  defaults (Deployment/API:8000) so the pipeline doesn't
+                  break, but admin should add a spec via /pulse-align.
+                Role/Kind/Port inputs are no longer surfaced in the form —
+                the repo owns the shape. */}
+            {repoInspection?.has_components_yml || repoInspection?.has_workers_yml ? (
+              <div className="flex gap-2 rounded-xl border border-emerald-300 bg-emerald-50 px-3 py-2 text-xs text-emerald-900 dark:border-emerald-900/50 dark:bg-emerald-900/20 dark:text-emerald-200">
+                <span className="mt-0.5 flex-shrink-0">✓</span>
                 <span>
-                  Scaffolded from <code className="rounded bg-blue-100 px-1 font-mono dark:bg-blue-900/40">devops/workers.yml</code>.
-                  Port/host/env-vars come from that file.
+                  Workload shape from{" "}
+                  <code className="rounded bg-emerald-100 px-1 font-mono dark:bg-emerald-900/40">
+                    devops/{repoInspection?.has_components_yml ? "components.yml" : "workers.yml"}
+                  </code>
+                  .{" "}
+                  {repoInspection?.components_summary?.valid && (repoInspection.components_summary.component_count ?? 0) > 0 ? (
+                    <>
+                      Detected:{" "}
+                      <span className="font-medium">
+                        {repoInspection.components_summary.component_count}{" "}
+                        {repoInspection.components_summary.component_count === 1 ? "component" : "components"}
+                      </span>
+                      {repoInspection.components_summary.kind_counts && (
+                        <>
+                          {" "}(
+                          {Object.entries(repoInspection.components_summary.kind_counts)
+                            .map(([k, n]) => `${n} ${k}`)
+                            .join(", ")}
+                          )
+                        </>
+                      )}
+                      .
+                    </>
+                  ) : (
+                    <>
+                      Detected:{" "}
+                      <span className="font-medium">
+                        {workloadKind}
+                        {role && role !== "Worker" ? `/${role}` : ""}
+                      </span>
+                      .
+                    </>
+                  )}{" "}
+                  To change shape, edit the file in the repo.
                 </span>
               </div>
-            )}
+            ) : repoInspection ? (
+              <div className="rounded-xl border-2 border-red-400 bg-red-50 px-4 py-3 text-xs text-red-900 dark:border-red-700 dark:bg-red-950/40 dark:text-red-200">
+                <div className="flex items-start gap-2">
+                  <AlertTriangle className="mt-0.5 h-4 w-4 flex-shrink-0 text-red-600 dark:text-red-400" />
+                  <div className="flex-1">
+                    <div className="font-semibold">
+                      Submit blocked —{" "}
+                      <code className="rounded bg-red-100 px-1 font-mono dark:bg-red-900/40">
+                        devops/components.yml
+                      </code>{" "}
+                      required for every Pulse-managed repo.
+                    </div>
+                    <div className="mt-1 text-red-800/90 dark:text-red-300/90">
+                      Bootstrap the repo with pulse-align (scaffolds
+                      Dockerfile.{"{staging,prod}"} + components.yml + non-root
+                      USER + /health + devops/test.sh). Three steps below —
+                      install plugin → run skill → commit + push, then refresh.
+                    </div>
+                  </div>
+                </div>
 
-            {/* Ingress toggle — default flips with role (API/UI/Streamlit
-                → on, Worker → off) but the user can opt in/out either way.
-                Hidden entirely for ScaledJob (workers are queue-driven —
-                ingress never makes sense, and we force needs_ingress=false
-                on submit regardless of checkbox state). */}
-            {!isScaledJob && (
+                {/* Step 1 — install plugin (one-time per dev machine). */}
+                <div className="mt-3">
+                  <div className="mb-1.5 flex items-center gap-2 text-[11px] font-semibold uppercase tracking-wide text-red-800 dark:text-red-300">
+                    <span className="flex h-5 w-5 items-center justify-center rounded-full bg-red-200 font-mono text-[10px] dark:bg-red-900/60">1</span>
+                    Install the plugin (skip if already installed)
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <code className="flex-1 select-all whitespace-pre-wrap rounded-lg border border-red-300 bg-red-100/60 px-2 py-1.5 font-mono text-[11px] leading-relaxed dark:border-red-800 dark:bg-red-900/40">
+{`/plugin marketplace add git@bitbucket.org:metawhale/ash-tadi.git
+/plugin install pulse-align@seven-gen`}
+                    </code>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        navigator.clipboard?.writeText(
+                          "/plugin marketplace add git@bitbucket.org:metawhale/ash-tadi.git\n/plugin install pulse-align@seven-gen"
+                        )
+                      }
+                      title="Copy plugin install commands"
+                      className="self-start rounded-lg border border-red-300 bg-red-100 px-2 py-1.5 text-[11px] font-medium transition-colors hover:bg-red-200 dark:border-red-800 dark:bg-red-900/40 dark:hover:bg-red-900/60"
+                    >
+                      Copy
+                    </button>
+                  </div>
+                </div>
+
+                {/* Step 2 — activate skill inside the app repo. */}
+                <div className="mt-2.5">
+                  <div className="mb-1.5 flex items-center gap-2 text-[11px] font-semibold uppercase tracking-wide text-red-800 dark:text-red-300">
+                    <span className="flex h-5 w-5 items-center justify-center rounded-full bg-red-200 font-mono text-[10px] dark:bg-red-900/60">2</span>
+                    Run the skill inside your app repo
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <code className="flex-1 select-all rounded-lg border border-red-300 bg-red-100/60 px-2 py-1.5 font-mono text-[11px] dark:border-red-800 dark:bg-red-900/40">
+                      /pulse-align
+                    </code>
+                    <button
+                      type="button"
+                      onClick={() => navigator.clipboard?.writeText("/pulse-align")}
+                      title="Copy /pulse-align"
+                      className="rounded-lg border border-red-300 bg-red-100 px-2 py-1.5 text-[11px] font-medium transition-colors hover:bg-red-200 dark:border-red-800 dark:bg-red-900/40 dark:hover:bg-red-900/60"
+                    >
+                      Copy
+                    </button>
+                  </div>
+                </div>
+
+                {/* Step 3 — commit + push then come back here. */}
+                <div className="mt-2.5">
+                  <div className="mb-1.5 flex items-center gap-2 text-[11px] font-semibold uppercase tracking-wide text-red-800 dark:text-red-300">
+                    <span className="flex h-5 w-5 items-center justify-center rounded-full bg-red-200 font-mono text-[10px] dark:bg-red-900/60">3</span>
+                    Commit + push the scaffolded files
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <code className="flex-1 select-all whitespace-pre-wrap rounded-lg border border-red-300 bg-red-100/60 px-2 py-1.5 font-mono text-[11px] leading-relaxed dark:border-red-800 dark:bg-red-900/40">
+{`git add devops/ && git commit -m "Add Pulse-align scaffolding"
+git push origin main`}
+                    </code>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        navigator.clipboard?.writeText(
+                          'git add devops/ && git commit -m "Add Pulse-align scaffolding"\ngit push origin main'
+                        )
+                      }
+                      title="Copy git add/commit/push"
+                      className="self-start rounded-lg border border-red-300 bg-red-100 px-2 py-1.5 text-[11px] font-medium transition-colors hover:bg-red-200 dark:border-red-800 dark:bg-red-900/40 dark:hover:bg-red-900/60"
+                    >
+                      Copy
+                    </button>
+                  </div>
+                </div>
+
+                <div className="mt-3 flex items-center justify-between gap-3">
+                  <div className="text-[11px] italic text-red-800/80 dark:text-red-300/80">
+                    Reference:{" "}
+                    <a
+                      href="https://bitbucket.org/metawhale/ash-tadi/src/main/plugins/pulse-align/skills/pulse-align/SKILL.md"
+                      target="_blank"
+                      rel="noreferrer"
+                      className="underline hover:no-underline"
+                    >
+                      pulse-align skill docs (ash-tadi)
+                    </a>
+                    . The skill detects your repo's workload kind, scaffolds
+                    the canonical shape, and emits the exact Pulse form
+                    selections you'll need.
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setRefreshTick((t) => t + 1)}
+                    disabled={inspecting}
+                    title="Re-inspect this repo"
+                    className={`flex-shrink-0 rounded-lg border border-red-400 bg-red-100 px-3 py-1.5 text-[11px] font-semibold transition-colors hover:bg-red-200 dark:border-red-700 dark:bg-red-900/40 dark:hover:bg-red-900/60 ${
+                      inspecting ? "cursor-not-allowed opacity-50" : ""
+                    }`}
+                  >
+                    {inspecting ? "Inspecting…" : "↻ Re-inspect"}
+                  </button>
+                </div>
+              </div>
+            ) : null}
+
+            {/* Ingress toggle — only shown for repos WITHOUT components.yml
+                or workers.yml (legacy fallback path). When a spec file is
+                present, ingress is declared per-component in components.yml
+                (needs_ingress: true|false) and the form-level toggle is
+                redundant. ScaledJob is queue-driven — toggle always hidden,
+                needs_ingress forced false. */}
+            {!isScaledJob && !repoInspection?.has_components_yml && !repoInspection?.has_workers_yml && (
             <label className="flex items-center gap-2 text-sm">
               <input
                 type="checkbox"
@@ -998,86 +1324,71 @@ export function DeploymentForm({ onSubmitted }: DeploymentFormProps = {}) {
             )}
 
             {domainUsed && (
-              <div className="grid gap-3 md:grid-cols-[1fr,5.5rem]">
-                <div>
-                  <div className="mb-1 flex items-center justify-between">
-                    <span className="text-sm font-medium">Host</span>
-                    {!overrideHost ? (
-                      <button
-                        type="button"
-                        onClick={() => {
-                          setDomain(appName ? `${appName}.${domainZone}` : "");
-                          setOverrideHost(true);
-                        }}
-                        className="text-xs font-medium text-[#e8871e] hover:text-[#c2410c] dark:text-[#fbbf24]"
-                      >
-                        Override
-                      </button>
-                    ) : (
-                      <button
-                        type="button"
-                        onClick={() => {
-                          setOverrideHost(false);
-                          setDomain("");
-                        }}
-                        className="text-xs font-medium text-muted-foreground hover:text-foreground"
-                      >
-                        Use auto
-                      </button>
-                    )}
-                  </div>
-                  {overrideHost ? (
-                    <input
-                      type="text"
-                      value={domain}
-                      onChange={(e) => setDomain(e.target.value)}
-                      placeholder="my-app.media-meter.in"
-                      className={`${inputClass} font-mono`}
-                    />
-                  ) : previewHosts.length === 0 ? (
-                    <div className={`${inputClass} cursor-default select-text bg-muted/40 font-mono text-xs italic text-muted-foreground`}>
-                      enter a repo first…
-                    </div>
+              <div>
+                <div className="mb-1 flex items-center justify-between">
+                  <span className="text-sm font-medium">Host</span>
+                  {!overrideHost ? (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setDomain(appName ? `${appName}.${domainZone}` : "");
+                        setOverrideHost(true);
+                      }}
+                      className="text-xs font-medium text-[#e8871e] hover:text-[#c2410c] dark:text-[#fbbf24]"
+                    >
+                      Override
+                    </button>
                   ) : (
-                    <div className="space-y-1.5">
-                      {previewHosts.map(({ env, host }) => (
-                        <div
-                          key={env}
-                          className={`${inputClass} flex items-center justify-between gap-2 bg-muted/40 py-1.5 font-mono text-xs`}
-                        >
-                          <span className="shrink-0 rounded bg-card px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-muted-foreground">
-                            {env}
-                          </span>
-                          <span className="truncate text-foreground" title={host}>
-                            {host}
-                          </span>
-                        </div>
-                      ))}
-                    </div>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setOverrideHost(false);
+                        setDomain("");
+                      }}
+                      className="text-xs font-medium text-muted-foreground hover:text-foreground"
+                    >
+                      Use auto
+                    </button>
                   )}
                 </div>
-                <div>
-                  <div className="mb-1 text-sm font-medium">Port</div>
+                {overrideHost ? (
                   <input
-                    type="number"
-                    min={1}
-                    max={65535}
-                    value={port}
-                    disabled={!portUsed}
-                    onChange={(e) => setPort(Number(e.target.value) || 0)}
-                    className={`${inputClass} ${!portUsed ? "cursor-not-allowed opacity-50" : ""}`}
+                    type="text"
+                    value={domain}
+                    onChange={(e) => setDomain(e.target.value)}
+                    placeholder="my-app.media-meter.in"
+                    className={`${inputClass} font-mono`}
                   />
-                </div>
-              </div>
-            )}
-
-            {!isDeployment && !isMultiWorker && (
-              <div className="flex gap-2 rounded-xl border border-amber-300 bg-amber-50 px-3 py-2 text-xs text-amber-800 dark:border-amber-900/50 dark:bg-amber-900/20 dark:text-amber-300">
-                <AlertTriangle className="mt-0.5 h-3.5 w-3.5 flex-shrink-0" />
-                <span>
-                  {workloadKind} manifests aren&apos;t auto-generated yet — the
-                  request records but DevOps writes the manifest.
-                </span>
+                ) : previewHosts.length === 0 ? (
+                  <div className={`${inputClass} cursor-default select-text bg-muted/40 font-mono text-xs italic text-muted-foreground`}>
+                    enter a repo first…
+                  </div>
+                ) : (
+                  <div className="space-y-1.5">
+                    {previewHosts.map(({ env, host }) => (
+                      <div
+                        key={env}
+                        className={`${inputClass} flex items-center justify-between gap-2 bg-muted/40 py-1.5 font-mono text-xs`}
+                      >
+                        <span className="shrink-0 rounded bg-card px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-muted-foreground">
+                          {env}
+                        </span>
+                        <span className="truncate text-foreground" title={host}>
+                          {host}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+                {/* Port comes from spec — only shown for legacy repos
+                    without components.yml (port matters there for the
+                    single-app generator path). For spec-driven repos,
+                    port lives per-component in components.yml. */}
+                {!repoInspection?.has_components_yml && !repoInspection?.has_workers_yml && (
+                  <div className="mt-2 text-xs italic text-muted-foreground">
+                    Port: <span className="font-mono">from inspect heuristic ({port})</span>
+                  </div>
+                )}
               </div>
             )}
           </div>
@@ -1170,10 +1481,83 @@ export function DeploymentForm({ onSubmitted }: DeploymentFormProps = {}) {
                       className={`${inputClass} font-mono text-xs`}
                     />
                   )}
-                  <p className="mt-1.5 text-xs text-muted-foreground">
-                    One <code className="rounded bg-muted px-1 font-mono text-[11px]">KEY=VALUE</code> per line. Goes into{" "}
-                    <code className="rounded bg-muted px-1 font-mono text-[11px]">config.properties</code>. Do <strong>not</strong> paste secrets here.
-                  </p>
+                  <div className="mt-1.5 space-y-1.5 text-xs text-muted-foreground">
+                    <p>
+                      One <code className="rounded bg-muted px-1 font-mono text-[11px]">KEY=VALUE</code> per line — non-secret app config only (LOG_LEVEL, APP_TAG, feature flags, ports, region settings). Lands in the per-app <code className="rounded bg-muted px-1 font-mono text-[11px]">config.properties</code> ConfigMap.
+                    </p>
+                    <p>
+                      Do <strong>not</strong> paste DB URIs, API keys, or anything confidential. Per-app secrets aren&rsquo;t supported yet — talk to DevOps.
+                    </p>
+                    <details className="rounded-md border border-border bg-muted/30 px-2 py-1">
+                      <summary className="cursor-pointer select-none text-xs">
+                        Already injected globally — don&rsquo;t re-paste these {GLOBAL_INJECTED_KEYS.length} keys
+                      </summary>
+                      <ul className="mt-1.5 grid grid-cols-2 gap-x-3 gap-y-0.5 font-mono text-[11px] sm:grid-cols-3">
+                        {GLOBAL_INJECTED_KEYS.map((k) => (
+                          <li key={k}>{k}</li>
+                        ))}
+                      </ul>
+                      <p className="mt-1.5 text-[11px] italic">
+                        Sourced from <code className="rounded bg-muted px-1 font-mono">global/devops-global-secrets</code> and auto-mirrored into every namespace via Reflector.
+                      </p>
+                    </details>
+                  </div>
+                  {/* Collision warning — fires when a pasted KEY matches a
+                      globally-injected key. The Secret's envFrom comes
+                      AFTER the ConfigMap's so the dev's value would be
+                      silently overridden at pod start. */}
+                  {(() => {
+                    const text = activeEnvTab === "staging" ? envVarsStaging : envVarsProduction;
+                    if (!text.trim()) return null;
+                    const pasted = new Set(
+                      text
+                        .split(/\r?\n/)
+                        .map((line) => line.trim())
+                        .filter((line) => line && !line.startsWith("#") && line.includes("="))
+                        .map((line) => line.split("=", 1)[0].trim())
+                    );
+                    const collisions = GLOBAL_INJECTED_KEYS.filter((k) => pasted.has(k));
+                    if (collisions.length === 0) return null;
+                    return (
+                      <p className="mt-1.5 flex items-start gap-1.5 text-xs text-amber-700 dark:text-amber-400">
+                        <AlertTriangle className="mt-0.5 h-3.5 w-3.5 flex-shrink-0" />
+                        <span>
+                          <strong>{collisions.length}</strong> key{collisions.length === 1 ? "" : "s"} already injected globally — the cluster secret wins, your pasted value will be ignored at runtime:{" "}
+                          <span className="font-mono">{collisions.join(", ")}</span>
+                        </span>
+                      </p>
+                    );
+                  })()}
+                  {/* UI framework env-prefix warning. Vite, Next, CRA strip
+                      any env var without the right prefix at build time —
+                      surfacing this here prevents the silent-bug class. */}
+                  {(() => {
+                    const prefix = repoInspection?.inferred_env_prefix;
+                    if (!prefix || role !== "UI") return null;
+                    const text = activeEnvTab === "staging" ? envVarsStaging : envVarsProduction;
+                    if (!text.trim()) return null;
+                    const offenders = text
+                      .split(/\r?\n/)
+                      .map((line) => line.trim())
+                      .filter((line) => line && !line.startsWith("#") && line.includes("="))
+                      .map((line) => line.split("=", 1)[0].trim())
+                      .filter((key) => key && !key.startsWith(prefix));
+                    if (offenders.length === 0) return null;
+                    return (
+                      <p className="mt-1.5 flex items-start gap-1.5 text-xs text-amber-700 dark:text-amber-400">
+                        <AlertTriangle className="mt-0.5 h-3.5 w-3.5 flex-shrink-0" />
+                        <span>
+                          <strong>{offenders.length}</strong> var{offenders.length === 1 ? "" : "s"} missing{" "}
+                          <code className="rounded bg-amber-100 px-1 font-mono text-[11px] dark:bg-amber-900/40">{prefix}</code>{" "}
+                          prefix and will be silently stripped at build time:{" "}
+                          <span className="font-mono">
+                            {offenders.slice(0, 5).join(", ")}
+                            {offenders.length > 5 ? `, +${offenders.length - 5} more` : ""}
+                          </span>
+                        </span>
+                      </p>
+                    );
+                  })()}
                 </>
               )}
             </>
@@ -1203,7 +1587,7 @@ export function DeploymentForm({ onSubmitted }: DeploymentFormProps = {}) {
         </div>
         <button
           type="submit"
-          disabled={loading || envsDisabled || repoBlockReason !== null || inspecting}
+          disabled={loading || envsDisabled || repoBlockReason !== null || specBlockReason !== null || inspecting}
           className="inline-flex items-center gap-2 rounded-xl bg-[#1a1a1a] px-5 py-2 text-sm font-medium text-white shadow-sm transition-colors hover:bg-[#2d1b0e] disabled:opacity-50 dark:bg-[#164e63] dark:hover:bg-[#0c2d3f]"
         >
           <Rocket className="h-4 w-4" />

@@ -2,7 +2,14 @@ from pydantic_settings import BaseSettings
 
 
 class Settings(BaseSettings):
-    MONGODB_URI: str = "mongodb://localhost:27017/pulse"
+    # Pulse's own metadata DB (users, endpoints, deployment requests).
+    # Distinct from `MONGODB_URI` which lives in devops-global-secrets
+    # and points at the on-prem mongodb1/2/3 cluster used for app data
+    # + monitored on the /dashboard/databases page. Both keys land in
+    # the pod env via envFrom; this rename prevents the on-prem URI
+    # (envFrom later index → wins) from overriding the Pulse metadata
+    # URI and pointing user lookups at the wrong DB.
+    PULSE_DB_URI: str = "mongodb://localhost:27017/pulse"
     DB_NAME: str = "pulse"
 
     JWT_SECRET_KEY: str = "change-me"
@@ -19,7 +26,24 @@ class Settings(BaseSettings):
 
     DISCORD_WEBHOOK_URL: str = ""
 
+    # Separate webhook for deployment-lifecycle notifications (new
+    # submissions awaiting approval, approve/reject decisions). Kept
+    # distinct from DISCORD_WEBHOOK_URL (endpoint monitoring) so the
+    # two streams can land in different Discord channels.
+    DISCORD_DEPLOYMENT_WEBHOOK_URL: str = ""
+
+    # Channel for DB up/down alerts fired by the sampler (Phase C).
+    # Separate from DISCORD_WEBHOOK_URL (endpoint monitoring) and
+    # DISCORD_DEPLOYMENT_WEBHOOK_URL (deploy approvals) so each stream
+    # lands in its own channel.
+    DISCORD_DB_ALERT_WEBHOOK_URL: str = ""
+
     DATA_RETENTION_DAYS: int = 30
+
+    # Time-series sampler for the Databases page (Phase B). Every N
+    # seconds the sampler probes each inventory key and inserts a
+    # DbMetricSample. Clamped to >=15s in services/db_sampler.py.
+    PULSE_DB_SAMPLE_INTERVAL: int = 60
 
     LLM_URL: str = ""
     LLM_KEY: str = ""
@@ -49,9 +73,35 @@ class Settings(BaseSettings):
     # Jenkins callback (phase 2) will advance to completed.
     PULSE_DRY_RUN: bool = True
 
+    # Kafka. In-cluster clients use `kafka.kafka.svc.cluster.local:9092`
+    # (PLAINTEXT CLIENT listener). Out-of-cluster (local docker, staging
+    # dev boxes) hit the NodePort on the EXTERNAL listener — SASL_PLAINTEXT
+    # with the `user1` client account. Auth fields left blank when
+    # KAFKA_SECURITY_PROTOCOL=PLAINTEXT.
+    KAFKA_BOOTSTRAP: str = "kafka.kafka.svc.cluster.local:9092"
+    KAFKA_SECURITY_PROTOCOL: str = "PLAINTEXT"   # or SASL_PLAINTEXT
+    KAFKA_SASL_MECHANISM: str = "PLAIN"          # PLAIN | SCRAM-SHA-256 | SCRAM-SHA-512
+    KAFKA_SASL_USERNAME: str = ""
+    KAFKA_SASL_PASSWORD: str = ""
+    KAFKA_TOPIC_JOBS: str = "pulse.deploy.jobs"
+    KAFKA_TOPIC_EVENTS: str = "pulse.deploy.events"
+    KAFKA_TOPIC_OUTCOMES: str = "pulse.deploy.outcomes"
+    KAFKA_CONSUMER_GROUP: str = "pulse-api-events"
+    # Transport switch for stage status. `http` (default) keeps Jenkins →
+    # POST /api/deployments/status; `kafka` reads from pulse.deploy.events;
+    # `dual` runs both consumers side-by-side during the parity window.
+    PULSE_STAGE_TRANSPORT: str = "http"
+
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"
+        # Don't crash on undeclared env vars. The pod env contains a lot
+        # of keys from devops-global-secrets (MONGODB_URI, REDIS_*_URI,
+        # ES_*_URI, POSTGRES_URI, ...) that the /api/databases handler
+        # reads directly via os.environ — they don't belong on Settings.
+        # `extra = "ignore"` lets Settings boot even when those keys
+        # are present.
+        extra = "ignore"
 
 
 settings = Settings()

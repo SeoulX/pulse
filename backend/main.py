@@ -20,13 +20,48 @@ from api.handlers.discover import router as discover_router
 from api.handlers.export import router as export_router
 from api.handlers.health import router as health_router
 from api.handlers.deployments import router as deployments_router
+from api.handlers.databases import router as databases_router
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_db()
-    yield
-    await close_db()
+    # Kick off the Databases time-series sampler. Fire-and-forget — the
+    # task is cancelled on shutdown via the finally block below.
+    import asyncio
+    from services.db_sampler import run_sampler_loop
+    sampler_task = asyncio.create_task(run_sampler_loop())
+
+    # Kafka producer + optional stage-event consumer. Consumer is only
+    # started when PULSE_STAGE_TRANSPORT ∈ {kafka, dual}; the http path
+    # keeps working regardless (POST /api/deployments/status handler).
+    from services import kafka_events
+    from api.handlers.deployments import handle_kafka_event
+    kafka_started = False
+    try:
+        await kafka_events.start_producer()
+        kafka_started = True
+        if settings.PULSE_STAGE_TRANSPORT in ("kafka", "dual"):
+            kafka_events.start_consumer(handle_kafka_event)
+    except Exception:
+        # Kafka is optional for boot — degrade to http-only, log, keep going.
+        traceback.print_exc()
+
+    try:
+        yield
+    finally:
+        sampler_task.cancel()
+        try:
+            await sampler_task
+        except (asyncio.CancelledError, Exception):
+            pass
+        if kafka_started:
+            try:
+                await kafka_events.stop_consumer()
+                await kafka_events.stop_producer()
+            except Exception:
+                pass
+        await close_db()
 
 
 app = FastAPI(title="Pulse API", version="1.0.0", lifespan=lifespan)
@@ -61,3 +96,4 @@ app.include_router(cron_router, prefix=prefix)
 app.include_router(discover_router, prefix=prefix)
 app.include_router(export_router, prefix=prefix)
 app.include_router(deployments_router, prefix=prefix)
+app.include_router(databases_router, prefix=prefix)

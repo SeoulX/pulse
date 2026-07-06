@@ -19,6 +19,7 @@ def serialize_endpoint(ep: Endpoint) -> dict:
         "_id": str(ep.id),
         "projectId": str(ep.project_id) if ep.project_id else None,
         "name": ep.name,
+        "kind": getattr(ep, "kind", "http"),
         "url": ep.url,
         "method": ep.method,
         "expectedStatusCode": ep.expected_status_code,
@@ -64,6 +65,7 @@ async def create_endpoint(body: CreateEndpointRequest, admin: User = Depends(req
     ep = Endpoint(
         project_id=PydanticObjectId(body.project_id) if body.project_id else None,
         name=body.name,
+        kind=body.kind,
         url=body.url,
         method=body.method,
         expected_status_code=body.expected_status_code,

@@ -1,3 +1,4 @@
+import re
 import traceback
 import uuid
 from datetime import datetime, timezone
@@ -9,6 +10,7 @@ from core.config import settings
 from models.deployment import DeploymentRequest
 from models.user import User
 from schemas.deployment import (
+    AddWorkerRequest,
     ApproveDeploymentRequest,
     CreateDeploymentRequest,
     PipelineCallback,
@@ -18,14 +20,24 @@ from services.bitbucket import (
     BOOTSTRAP_TAGS,
     add_webhook,
     classify_tags,
+    commit_file,
+    create_branch,
     delete_tag,
     fetch_repo_file,
     inspect_repo,
     list_tags,
+    next_alpha_tag,
     parse_repo_slug,
     push_tag,
 )
 from services.redis_specs import enqueue_job, publish_spec
+from services import kafka_events
+from models.deployment_event import DeploymentEvent
+from services.discord_deploy_notifier import (
+    notify_decision,
+    notify_pending_approval,
+)
+from schemas.components import ComponentsParseError, parse_components_yaml
 from schemas.workers import WorkersParseError, parse_workers_yaml
 
 router = APIRouter(prefix="/deployments", tags=["deployments"])
@@ -127,6 +139,13 @@ def _build_jenkins_spec(d: DeploymentRequest) -> dict:
     # dispatch (`spec.workers // empty`) routes to scaledjob-multi.sh.
     if d.workers:
         spec["workers"] = d.workers
+    # Monorepo / polyworkload spec (devops/components.yml). Generator's
+    # Phase 2 branch fans out per image_target — Pattern A renders N flat
+    # trees, Pattern B emits a nested polyworkload tree (partial — falls
+    # back to single-app today).
+    if d.components:
+        spec["components"] = d.components
+        spec["image_target"] = d.image_target or "per-component"
     if profile:
         spec["profile"] = profile
     spec["domainZone"] = d.domain_zone
@@ -248,16 +267,23 @@ async def _build_planned(dep: DeploymentRequest) -> dict:
     tag_class = classify_tags(existing_tags)
 
     env_tag_map = {"staging": "v0.0.0-alpha", "production": "v0.0.0"}
+    # Per-env branch source — staging tag cuts from `staging` branch,
+    # production cuts from the default branch (main or master). Pulse
+    # auto-creates the staging branch from default during dispatch when
+    # missing (see approve flow).
+    env_branch_map = {"staging": "staging", "production": None}  # None = default branch
     planned_tag_names = [env_tag_map[e] for e in dep.environments]
     conflicted = set(tag_class["bootstrap"]) & set(planned_tag_names)
 
     tag_actions: list[dict] = []
-    for tag in planned_tag_names:
+    for env in dep.environments:
+        tag = env_tag_map[env]
+        from_branch = env_branch_map[env]
         if tag in conflicted:
             tag_actions.append(
                 {"action": "delete_tag", "name": tag, "reason": "bootstrap tag already exists"}
             )
-        tag_actions.append({"action": "push_tag", "name": tag})
+        tag_actions.append({"action": "push_tag", "name": tag, "from_branch": from_branch, "env": env})
 
     return {
         "repo_slug": dep.repo_slug,
@@ -335,6 +361,48 @@ async def track_deployment(token: str):
         "primaryToken": token,
         "submissionId": dep.submission_id,
         "records": [serialize_public(r) for r in records],
+    }
+
+
+@router.get("/track/{token}/events")
+async def track_deployment_events(token: str):
+    """Return the full stage-event timeline for a tracker token.
+
+    Rows are grouped by (env, attempt) so the tracker page can render one
+    column per env and one attempt block per column. Kafka redeliveries
+    already collapse at the DB via the unique (track_token, build_id,
+    stage, state) index, so this endpoint is a straight read.
+    """
+    dep = await DeploymentRequest.find_one(DeploymentRequest.track_token == token)
+    if not dep:
+        raise HTTPException(status_code=404, detail="Tracking link not found")
+    tokens = [token]
+    if dep.submission_id:
+        siblings = await DeploymentRequest.find(
+            DeploymentRequest.submission_id == dep.submission_id
+        ).to_list()
+        tokens = [s.track_token for s in siblings]
+
+    events = await DeploymentEvent.find(
+        {"track_token": {"$in": tokens}}
+    ).sort("ts").to_list()
+
+    # Shape: {track_token: {attempt: [event, ...]}}
+    grouped: dict[str, dict[int, list[dict]]] = {}
+    for e in events:
+        by_attempt = grouped.setdefault(e.track_token, {})
+        by_attempt.setdefault(int(e.attempt or 1), []).append({
+            "stage": e.stage,
+            "state": e.state,
+            "buildId": e.build_id,
+            "jobId": e.job_id,
+            "ts": e.ts.isoformat(),
+            "error": e.error,
+        })
+    return {
+        "primaryToken": token,
+        "submissionId": dep.submission_id,
+        "timelines": grouped,
     }
 
 
@@ -461,6 +529,60 @@ async def create_deployment(body: CreateDeploymentRequest):
                 },
             )
 
+    # Monorepo / polyworkload: pull devops/components.yml + snapshot the
+    # parsed spec onto every record. Generator reads spec.components +
+    # spec.image_target to emit a nested polyworkload tree.
+    #
+    # Policy (2026-06-16): pulse-align is REQUIRED — every Pulse-managed
+    # repo must declare devops/components.yml (or devops/workers.yml for
+    # ScaledJob multi-worker repos). Form blocks submit client-side; this
+    # is the server-side gate so direct API callers also hit it.
+    parsed_components = None
+    parsed_image_target = None
+    components_yaml = await fetch_repo_file(slug, "devops/components.yml")
+    if components_yaml:
+        try:
+            spec_obj = parse_components_yaml(components_yaml)
+            parsed_components = [c.model_dump() for c in spec_obj.components]
+            parsed_image_target = spec_obj.image_target
+        except ComponentsParseError as e:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "message": "devops/components.yml failed validation",
+                    "errors": e.errors,
+                },
+            )
+    elif body.workload_kind != "ScaledJob":
+        # No components.yml AND not a ScaledJob multi-worker (which uses
+        # workers.yml instead) → reject with a pulse-align hint.
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": (
+                    f"devops/components.yml is required on {slug}. Run "
+                    f"the pulse-align skill in the repo, commit + push, "
+                    f"then re-submit. See pulse-align SKILL.md in ash-tadi."
+                ),
+                "code": "MISSING_COMPONENTS_YML",
+                "scaffolding_hint": "/pulse-align",
+            },
+        )
+
+        # Form override semantics for needs_ingress on polyworkload repos.
+        # The form has ONE checkbox covering the whole repo, but
+        # components.yml declares needs_ingress per component. Rule:
+        #   form needs_ingress = False (admin explicitly OFF)  → sweep ALL components to false
+        #   form needs_ingress = True / None                   → leave components.yml values alone
+        # i.e. the form can DISABLE ingress repo-wide but cannot force-
+        # enable a component that didn't declare it. Keeps the mental
+        # model simple — "uncheck = no ingress anywhere" — and prevents
+        # accidentally exposing a worker that the repo intended private.
+        if body.needs_ingress is False:
+            for comp in parsed_components:
+                if comp.get("needs_ingress"):
+                    comp["needs_ingress"] = False
+
     submission_id = uuid.uuid4().hex
     created: list[DeploymentRequest] = []
     for env in body.environments:
@@ -483,6 +605,8 @@ async def create_deployment(body: CreateDeploymentRequest):
             requested_by=body.requested_by,
             submission_id=submission_id,
             workers=parsed_workers,
+            components=parsed_components,
+            image_target=parsed_image_target,
             needs_ingress=body.needs_ingress,
         )
         await dep.insert()
@@ -497,11 +621,174 @@ async def create_deployment(body: CreateDeploymentRequest):
         print(f"  {env_name:10s}  id={d.id}  token={d.track_token}")
     print("=" * 60, flush=True)
 
+    # Best-effort Discord ping — never blocks the submit on outage.
+    await notify_pending_approval(created)
+
+    # SECTION END — `create_deployment` (kind="new"). The
+    # `add_worker_deployment` endpoint below is the second submission
+    # path, sharing the same DeploymentRequest collection + approval
+    # flow but with a different approve action (workers.yml patch).
     out = []
     for d in created:
         preview = await _build_planned(d)
         out.append({**serialize(d), "planned": preview})
     return out
+
+
+# Regex shared with schemas/workers.py — keep in sync.
+_WORKER_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
+_COMPONENT_NAME_RE = re.compile(r"^[a-z][a-z0-9-]*$")
+
+
+@router.post("/add-worker", status_code=201)
+async def add_worker_deployment(body: AddWorkerRequest):
+    """Public: any dev can submit. Admin approves to apply.
+
+    Creates a DeploymentRequest with kind="add_worker" that, on
+    approval, edits the customer repo's devops/workers.yml + pushes a
+    new alpha tag. Staging-only on the apply side (MVP).
+    """
+    try:
+        slug = parse_repo_slug(body.repo_url)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    # Shape validation matching schemas/workers.py.
+    if not _COMPONENT_NAME_RE.match(body.component):
+        raise HTTPException(
+            status_code=400,
+            detail=f"component name '{body.component}' must be lowercase letters/digits/dashes",
+        )
+    if not _WORKER_NAME_RE.match(body.worker):
+        raise HTTPException(
+            status_code=400,
+            detail=f"worker name '{body.worker}' must be UPPERCASE letters/digits/underscores",
+        )
+
+    # Confirm the component exists in the current workers.yml so the
+    # dev gets feedback at submit time rather than at approve time.
+    current = await fetch_repo_file(slug, "devops/workers.yml")
+    if not current:
+        raise HTTPException(
+            status_code=400,
+            detail=f"devops/workers.yml missing on {slug} — add it first via a normal deploy.",
+        )
+    try:
+        spec = parse_workers_yaml(current).model_dump()
+    except WorkersParseError as e:
+        raise HTTPException(
+            status_code=400,
+            detail={"message": "current devops/workers.yml fails validation", "errors": e.errors},
+        )
+    components_present = {c["name"] for c in spec.get("components", [])}
+    if body.component not in components_present:
+        raise HTTPException(
+            status_code=400,
+            detail=f"component '{body.component}' not in workers.yml. Present: {sorted(components_present)}",
+        )
+    # Block duplicates inside the chosen component.
+    target_component = next(c for c in spec["components"] if c["name"] == body.component)
+    if body.worker in (target_component.get("workers") or {}):
+        raise HTTPException(
+            status_code=409,
+            detail=f"worker '{body.worker}' already exists under component '{body.component}'",
+        )
+
+    add_worker_spec = {
+        "component": body.component,
+        "worker": body.worker,
+        "max": body.max_replicas,
+        "batch": body.batch,
+        "list_name": body.list_name,
+    }
+    submission_id = uuid.uuid4().hex
+    dep = DeploymentRequest(
+        repo_slug=slug,
+        repo_url=body.repo_url,
+        team="DC/ML",
+        workload_kind="ScaledJob",
+        role=None,
+        cluster="kl-2",
+        environments=["staging"],  # MVP: staging-only
+        env_vars={},
+        requested_by=body.requested_by,
+        submission_id=submission_id,
+        kind="add_worker",
+        add_worker_spec=add_worker_spec,
+    )
+    await dep.insert()
+
+    print("=" * 60)
+    print(f"[ADD-WORKER SUBMITTED] {slug} — {body.component}/{body.worker}, awaiting DevOps approval")
+    print(f"  submission_id: {submission_id}  id={dep.id}  token={dep.track_token}")
+    print("=" * 60, flush=True)
+
+    await notify_pending_approval([dep])
+    return {**serialize(dep), "addWorkerSpec": add_worker_spec}
+
+
+async def _apply_add_worker(dep: DeploymentRequest) -> dict:
+    """Approve-time apply for kind="add_worker".
+
+    1. Re-fetch devops/workers.yml fresh (covers race where another
+       request landed first).
+    2. Insert the new worker under the requested component.
+    3. Commit the updated file back to Bitbucket.
+    4. Compute next alpha tag from existing tags, push it.
+
+    Returns a small summary the response card surfaces. Raises on any
+    failure — caller catches and flips status to `failed`.
+    """
+    import yaml  # lazy — only imported on this code path
+
+    spec = dep.add_worker_spec or {}
+    component = spec["component"]
+    worker = spec["worker"]
+
+    current = await fetch_repo_file(dep.repo_slug, "devops/workers.yml")
+    if not current:
+        raise RuntimeError(f"devops/workers.yml vanished from {dep.repo_slug} between submit and approve")
+
+    parsed = yaml.safe_load(current) or {}
+    components = parsed.setdefault("components", {})
+    comp_block = components.setdefault(component, {})
+    if worker in comp_block:
+        # Idempotent re-approve — caller wins the no-op.
+        return {"skipped": True, "reason": f"{component}/{worker} already present"}
+
+    # Build the per-worker entry. None values dropped so we don't
+    # serialize empty fields — the schema's defaults apply at parse
+    # time on the next pipeline run.
+    entry: Dict[str, Any] = {}
+    if spec.get("max") is not None:
+        entry["max"] = spec["max"]
+    if spec.get("batch") is not None:
+        entry["batch"] = spec["batch"]
+    if spec.get("list_name"):
+        entry["list_name"] = spec["list_name"]
+    comp_block[worker] = entry or {}  # `{}` shape = defaults
+
+    updated = yaml.safe_dump(parsed, sort_keys=False, default_flow_style=False)
+
+    commit_msg = f"add worker {component}/{worker} via Pulse ({dep.requested_by})"
+    author = f"Pulse <{dep.requested_by}>"
+    commit_res = await commit_file(
+        dep.repo_slug, "devops/workers.yml", updated,
+        message=commit_msg, author=author,
+    )
+
+    # Bump the latest alpha tag — Jenkins picks it up on push.
+    existing = await list_tags(dep.repo_slug)
+    new_tag = next_alpha_tag(existing)
+    tag_res = await push_tag(dep.repo_slug, new_tag)
+
+    return {
+        "commit": commit_res.get("commit"),
+        "tag": new_tag,
+        "tag_result": tag_res,
+        "component": component,
+        "worker": worker,
+    }
 
 
 @router.post("/{deployment_id}/approve")
@@ -535,6 +822,25 @@ async def approve_deployment(
     dep.status = "approved"
     await dep.save()
 
+    # Discord ping — admin decided, share with team.
+    await notify_decision(dep, approved=True)
+
+    # Add-worker requests take a separate, smaller code path: patch
+    # workers.yml and bump an alpha tag. Skip the new-app dry-run /
+    # tag-bootstrap / spec-publish flow entirely.
+    if dep.kind == "add_worker":
+        try:
+            result = await _apply_add_worker(dep)
+            dep.status = "completed"
+            await dep.save()
+            return {**serialize(dep), "addWorkerResult": result}
+        except Exception as exc:
+            traceback.print_exc()
+            dep.status = "failed"
+            dep.error = f"add_worker apply failed: {exc}"
+            await dep.save()
+            raise HTTPException(status_code=502, detail=str(exc))
+
     planned = await _build_planned(dep)
 
     if settings.PULSE_DRY_RUN:
@@ -554,14 +860,34 @@ async def approve_deployment(
         dep.status = "webhook_added"
         await dep.save()
 
+        # Track which branches we've already auto-created this dispatch
+        # so we don't redundantly hit the create endpoint per env when
+        # both envs pull from the same branch.
+        ensured_branches: set[str] = set()
+
         for action in planned["tags"]:
             name = action["name"]
             if action["action"] == "delete_tag":
                 result = await delete_tag(dep.repo_slug, name)
                 print(f"[DEPLOYMENT DISPATCH] {dep.repo_slug} delete {name}: {result}", flush=True)
             elif action["action"] == "push_tag":
-                result = await push_tag(dep.repo_slug, name)
-                print(f"[DEPLOYMENT DISPATCH] {dep.repo_slug} push {name}: {result}", flush=True)
+                from_branch = action.get("from_branch")  # None → default branch
+                # Auto-create staging branch from default if missing —
+                # devs at this org keep `staging` + `main`/`master`,
+                # but new repos sometimes only have main at bootstrap.
+                if from_branch and from_branch not in ensured_branches:
+                    br_res = await create_branch(dep.repo_slug, from_branch)
+                    print(
+                        f"[DEPLOYMENT DISPATCH] {dep.repo_slug} ensure branch {from_branch}: {br_res}",
+                        flush=True,
+                    )
+                    ensured_branches.add(from_branch)
+                result = await push_tag(dep.repo_slug, name, from_branch=from_branch)
+                print(
+                    f"[DEPLOYMENT DISPATCH] {dep.repo_slug} push {name} "
+                    f"(branch={from_branch or 'default'}): {result}",
+                    flush=True,
+                )
 
         dep.status = "tags_pushed"
         await dep.save()
@@ -571,15 +897,45 @@ async def approve_deployment(
         # bootstrap time and RPOPs pulse:queue:<slug> to claim this build.
         try:
             spec = _build_jenkins_spec(dep)
+            # Attach the tracking IDs to the spec so Jenkins can echo them
+            # back on every Kafka event → tracker page stays stable across
+            # retries and rebuilds without Pulse having to look anything up.
+            spec["trackToken"] = dep.track_token
+            spec["submissionId"] = dep.submission_id
+            spec["deploymentId"] = str(dep.id)
+            spec["attempt"] = dep.attempt
             publish_spec(dep.repo_slug, spec)
             job_id = enqueue_job(
                 dep.repo_slug,
                 deployment_id=str(dep.id),
                 requested_by=dep.requested_by,
             )
+            # Dual-write to Kafka. When PULSE_STAGE_TRANSPORT flips to kafka
+            # the Jenkins consumer switches; the Redis queue stays alive as
+            # fallback for one release cycle before removal.
+            try:
+                env_for_job = dep.environments[0] if dep.environments else "staging"
+                tag_for_job = (
+                    f"{dep.args.get('tag', 'v0.0.0')}"
+                    if isinstance(dep.args, dict)
+                    else "v0.0.0"
+                )
+                kafka_job_id = await kafka_events.enqueue_job(
+                    track_token=dep.track_token,
+                    submission_id=dep.submission_id,
+                    slug=dep.repo_slug,
+                    env=env_for_job,
+                    tag=tag_for_job,
+                    requested_by=dep.requested_by,
+                    deployment_id=str(dep.id),
+                )
+                dep.latest_job_id = kafka_job_id
+            except Exception as kexc:
+                # Kafka is best-effort during the dual-write window.
+                print(f"[DEPLOYMENT DISPATCH] kafka enqueue skipped: {kexc}", flush=True)
             print(
                 f"[DEPLOYMENT DISPATCH] {dep.repo_slug} redis spec+queue published"
-                f" (job_id={job_id})",
+                f" (job_id={job_id}, kafka_job_id={dep.latest_job_id})",
                 flush=True,
             )
         except Exception as redis_exc:
@@ -636,6 +992,8 @@ async def reject_deployment(
         f" — reason: {body.reason or '(no reason)'}",
         flush=True,
     )
+
+    await notify_decision(dep, approved=False, reason=body.reason)
 
     return serialize(dep)
 
@@ -778,6 +1136,52 @@ async def pipeline_callback(repo_slug: str, body: PipelineCallback):
 
     await dep.save()
 
+    # Persist the stage transition + fan out on Kafka. Direct write (not
+    # via the consumer) because we already have the DeploymentRequest in
+    # hand and skipping the round-trip removes Kafka from the critical
+    # path of the tracker view. Kafka event is fire-and-forget for
+    # downstream consumers (dashboards, BI, on-call bots).
+    stage_val = body.status
+    state_val = (
+        "failed"
+        if body.status in _FAILURE_STATUSES
+        else ("success" if body.status == "completed" else "started")
+    )
+    try:
+        await DeploymentEvent(
+            track_token=dep.track_token,
+            submission_id=dep.submission_id,
+            deployment_id=str(dep.id),
+            slug=dep.repo_slug,
+            env=body.env or (dep.environments[0] if dep.environments else ""),
+            build_id=getattr(body, "build_id", None) or dep.latest_build_id,
+            job_id=dep.latest_job_id,
+            attempt=int(dep.attempt or 1),
+            stage=stage_val,
+            state=state_val,
+            error=body.error,
+        ).insert()
+    except Exception as evt_exc:
+        if "duplicate key" not in str(evt_exc).lower():
+            traceback.print_exc()
+    try:
+        await kafka_events.publish_event(
+            track_token=dep.track_token,
+            submission_id=dep.submission_id,
+            deployment_id=str(dep.id),
+            slug=dep.repo_slug,
+            env=body.env or (dep.environments[0] if dep.environments else ""),
+            tag=None,
+            stage=stage_val,
+            state=state_val,
+            attempt=int(dep.attempt or 1),
+            build_id=dep.latest_build_id,
+            job_id=dep.latest_job_id,
+            error=body.error,
+        )
+    except Exception:
+        pass
+
     print(
         f"[PIPELINE CALLBACK] {repo_slug} env={body.env or 'legacy'}"
         f" → {body.status} (aggregate={dep.status}, id={dep.id})",
@@ -789,4 +1193,166 @@ async def pipeline_callback(repo_slug: str, body: PipelineCallback):
         "deploymentId": str(dep.id),
         "status": dep.status,
         "envStatuses": dep.env_statuses,
+    }
+
+
+# ── Kafka stage-event consumer handler ─────────────────────────────────────
+#
+# Wired at boot in main.lifespan when PULSE_STAGE_TRANSPORT ∈ {kafka, dual}.
+# Processes one message from pulse.deploy.events. Idempotent via the unique
+# index on DeploymentEvent (track_token, build_id, stage, state) — kafka
+# redeliveries land as no-ops after the first successful write.
+_STAGE_TO_STATUS = {
+    # Jenkins stage names → the internal per-env status vocab used by
+    # env_statuses. When the mapping is missing we keep the raw stage as
+    # the status (the tracker page renders it verbatim); the aggregate
+    # worst-of stays sane because unknown values sort to 0.
+    "building_image": "building_image",
+    "pushing_manifest": "pushing_manifest",
+    "cleaning_up": "cleaning_up",
+    "completed": "completed",
+    "failed": "failed",
+    "failed_build": "failed_build",
+    "failed_manifest": "failed_manifest",
+}
+
+
+async def handle_kafka_event(payload: dict) -> None:
+    if payload.get("schema") != "pulse.deploy.event.v1":
+        return
+    track_token = payload.get("track_token")
+    if not track_token:
+        return
+
+    # 1. Append immutable event row (idempotent via unique index).
+    try:
+        await DeploymentEvent(
+            track_token=track_token,
+            submission_id=payload.get("submission_id"),
+            deployment_id=str(payload.get("deployment_id") or ""),
+            slug=payload.get("slug") or "",
+            env=payload.get("env") or "",
+            build_id=payload.get("build_id"),
+            job_id=payload.get("job_id"),
+            attempt=int(payload.get("attempt") or 1),
+            stage=payload.get("stage") or "",
+            state=payload.get("state") or "",
+            error=payload.get("error"),
+            tag=payload.get("tag"),
+        ).insert()
+    except Exception as exc:  # duplicate key = redelivery, ignore
+        if "duplicate key" not in str(exc).lower():
+            traceback.print_exc()
+
+    # 2. Advance DeploymentRequest.env_statuses. Only applies when the
+    #    state is terminal-for-stage — a stage `started` event does not
+    #    change env status (still building/pending).
+    state = payload.get("state")
+    if state not in ("success", "failed", "completed"):
+        return
+    stage = payload.get("stage") or ""
+    status_val = _STAGE_TO_STATUS.get(stage, stage)
+    if state == "failed":
+        status_val = "failed_build" if stage == "building_image" else (
+            "failed_manifest" if stage == "pushing_manifest" else "failed"
+        )
+
+    dep = await DeploymentRequest.find_one(
+        DeploymentRequest.track_token == track_token
+    )
+    if not dep:
+        return
+
+    # Track the latest build_id/job_id for O(1) tracker reads.
+    if payload.get("build_id"):
+        dep.latest_build_id = str(payload["build_id"])
+    if payload.get("job_id"):
+        dep.latest_job_id = str(payload["job_id"])
+
+    env = payload.get("env")
+    if env and len(dep.environments) == 1 and dep.environments[0] == env:
+        dep.status = status_val
+        if state == "failed":
+            dep.error = payload.get("error")
+    elif env:
+        env_statuses = dict(dep.env_statuses or {})
+        env_errors = dict(dep.env_errors or {})
+        env_statuses[env] = status_val
+        if state == "failed" and payload.get("error"):
+            env_errors[env] = payload["error"]
+        dep.env_statuses = env_statuses
+        dep.env_errors = env_errors
+        dep.status = _aggregate_status(
+            dep.environments, env_statuses, fallback=dep.status
+        )
+
+    await dep.save()
+
+
+# ── Retry endpoint ────────────────────────────────────────────────────────
+#
+# POST /api/deployments/{deployment_id}/retry
+# Bumps attempt, mints a fresh Kafka job_id, republishes the spec so
+# Jenkins picks it up on the next claim. Reversible — same track_token,
+# same tracker URL, timeline stacks the new attempt below the old one.
+@router.post("/{deployment_id}/retry")
+async def retry_deployment(
+    deployment_id: str,
+    admin: User = Depends(require_admin),
+):
+    dep = await DeploymentRequest.get(deployment_id)
+    if not dep:
+        raise HTTPException(status_code=404, detail="Deployment not found")
+    # Guard: refuse retry while a build is mid-flight (avoid double claims).
+    if dep.status in ("building_image", "pushing_manifest", "cleaning_up"):
+        raise HTTPException(
+            status_code=409,
+            detail=f"Deployment is still in progress (status={dep.status}); wait or fail it first",
+        )
+    dep.attempt = int(dep.attempt or 1) + 1
+    dep.status = "tags_pushed"
+    dep.error = None
+
+    # Re-publish spec (in case it was pruned) and enqueue on both queues.
+    try:
+        spec = _build_jenkins_spec(dep)
+        spec["trackToken"] = dep.track_token
+        spec["submissionId"] = dep.submission_id
+        spec["deploymentId"] = str(dep.id)
+        spec["attempt"] = dep.attempt
+        publish_spec(dep.repo_slug, spec)
+        enqueue_job(
+            dep.repo_slug,
+            deployment_id=str(dep.id),
+            requested_by=admin.email if hasattr(admin, "email") else str(admin),
+        )
+        env_for_job = dep.environments[0] if dep.environments else "staging"
+        tag_for_job = (
+            f"{dep.args.get('tag', 'v0.0.0')}"
+            if isinstance(dep.args, dict)
+            else "v0.0.0"
+        )
+        kafka_job_id = await kafka_events.enqueue_job(
+            track_token=dep.track_token,
+            submission_id=dep.submission_id,
+            slug=dep.repo_slug,
+            env=env_for_job,
+            tag=tag_for_job,
+            requested_by=dep.requested_by,
+            deployment_id=str(dep.id),
+        )
+        dep.latest_job_id = kafka_job_id
+    except Exception as exc:
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=502, detail=f"Retry enqueue failed: {exc}"
+        )
+
+    await dep.save()
+    return {
+        "matched": True,
+        "deploymentId": str(dep.id),
+        "attempt": dep.attempt,
+        "latestJobId": dep.latest_job_id,
+        "trackToken": dep.track_token,
     }

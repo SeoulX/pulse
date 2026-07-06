@@ -1,0 +1,40 @@
+# Local dev override — applied automatically by docker compose when
+# this file sits next to docker-compose.yml. Swaps the frontend service
+# from a production Next.js standalone build (~3 min cold rebuild per
+# edit) to a hot-reloading `next dev` server (instant HMR).
+#
+# To revert to the prod build flow:
+#   mv docker-compose.override.yml docker-compose.override.yml.disabled
+#   docker compose up -d --build frontend
+#
+# Backend is left as-is — it's a Python image with fast layer caching
+# and rebuilds in <30s on a code change.
+services:
+  frontend:
+    # Skip the multi-stage Dockerfile; use the node base directly so we
+    # don't bake the production build into the image at all.
+    image: node:18-alpine
+    working_dir: /app
+    # First boot installs deps; subsequent boots reuse the volume cache.
+    # `next dev` watches the mounted /app and recompiles routes on save.
+    command: sh -c "npm install --no-audit --no-fund && npm run dev -- --hostname 0.0.0.0"
+    volumes:
+      - ./frontend:/app
+      # Anonymous volume for node_modules so the host's tree doesn't
+      # shadow the container's (avoids platform-mismatch on native deps).
+      - /app/node_modules
+      # Same for .next so dev artifacts don't leak into the source tree.
+      - /app/.next
+    environment:
+      PULSE_API_INTERNAL_URL: http://backend:8000
+      # Forces Next.js to bind 0.0.0.0; --hostname above also covers this.
+      HOSTNAME: 0.0.0.0
+      # Polling fallback for filesystem watchers on docker desktop / WSL
+      # where inotify across the bind mount can miss edits.
+      CHOKIDAR_USEPOLLING: "true"
+      WATCHPACK_POLLING: "true"
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
+    restart: unless-stopped
