@@ -61,6 +61,23 @@ class Settings(BaseSettings):
     # store as `jenkins-shared-secret`. Empty disables the endpoint (returns 503).
     JENKINS_SHARED_SECRET: str = ""
 
+    # Pulse-to-Jenkins basic auth for the console proxy endpoint. Used only
+    # by GET /api/deployments/track/<token>/console. Empty disables the
+    # proxy (returns 503). Do NOT reuse JENKINS_SHARED_SECRET — that key
+    # authenticates the other direction.
+    JENKINS_BASE_URL: str = "https://jenkins.media-meter.in"
+    JENKINS_ADMIN_USER: str = ""
+    JENKINS_ADMIN_TOKEN: str = ""
+
+    # Infisical automation for on-approve scope bootstrap (project + env +
+    # folder). Pulse authenticates with a universal-auth machine identity
+    # holding org-scoped project-create + folder-create permissions. When
+    # any of the three is empty the bootstrap is skipped and deploys
+    # proceed without an Infisical scope.
+    INFISICAL_HOST_API: str = "https://infisical-kl.media-meter.in/api"
+    INFISICAL_ADMIN_CLIENT_ID: str = ""
+    INFISICAL_ADMIN_CLIENT_SECRET: str = ""
+
     # Redis (cluster's redis-stack/redis-kl1-master). Pulse publishes spec.json and
     # job entries here for Jenkins to consume at bootstrap time.
     REDIS_HOST: str = "192.168.10.40"

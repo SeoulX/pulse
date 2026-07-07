@@ -193,3 +193,68 @@
 .animate-dino-zzz {
   animation: dino-zzz 2s ease-in-out infinite;
 }
+
+/* Deployment tracker — animated connector between the last completed stage
+   and the currently-executing one. Gradient sweeps left→right so the eye
+   reads the pipeline as "still working on reaching the next step". */
+@keyframes pulse-connector-flow {
+  0%   { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+.pulse-connector {
+  background-image: linear-gradient(
+    90deg,
+    transparent 0%,
+    rgb(232 135 30 / 0.15) 20%,
+    rgb(232 135 30 / 0.95) 50%,
+    rgb(232 135 30 / 0.15) 80%,
+    transparent 100%
+  );
+  background-size: 200% 100%;
+  animation: pulse-connector-flow 1.6s linear infinite;
+}
+:is(.dark) .pulse-connector {
+  background-image: linear-gradient(
+    90deg,
+    transparent 0%,
+    rgb(42 127 158 / 0.15) 20%,
+    rgb(90 180 197 / 0.95) 50%,
+    rgb(42 127 158 / 0.15) 80%,
+    transparent 100%
+  );
+}
+
+/* Vertical connector variant — same animation as pulse-connector but
+   flowing top→bottom instead of left→right for the vertical tracker.
+   Image starts above the container (Y=200% pushes it up 2× container
+   height, peak invisible up top) and sweeps DOWN to Y=-200% so the
+   bright band visually reads as flowing from the last-completed stage
+   TOWARD the current in-flight stage below it. Do not swap the values
+   back — the naive `-200%→200%` moves the peak UPWARD (image shifts
+   down = peak inside image moves up in viewport coords). */
+@keyframes pulse-connector-flow-vertical {
+  0%   { background-position: 0 200%; }
+  100% { background-position: 0 -200%; }
+}
+.pulse-connector-vertical {
+  background-image: linear-gradient(
+    180deg,
+    transparent 0%,
+    rgb(232 135 30 / 0.15) 20%,
+    rgb(232 135 30 / 0.95) 50%,
+    rgb(232 135 30 / 0.15) 80%,
+    transparent 100%
+  );
+  background-size: 100% 200%;
+  animation: pulse-connector-flow-vertical 1.6s linear infinite;
+}
+:is(.dark) .pulse-connector-vertical {
+  background-image: linear-gradient(
+    180deg,
+    transparent 0%,
+    rgb(42 127 158 / 0.15) 20%,
+    rgb(90 180 197 / 0.95) 50%,
+    rgb(42 127 158 / 0.15) 80%,
+    transparent 100%
+  );
+}

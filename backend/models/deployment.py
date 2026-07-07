@@ -8,7 +8,7 @@ from pydantic import Field, field_validator
 
 WorkloadKind = Literal["Deployment", "StatefulSet", "ScaledJob", "CronJob"]
 DeploymentRole = Literal["API", "UI", "Worker", "Streamlit"]
-Cluster = Literal["kl-1", "kl-2"]
+Cluster = Literal["kl-1", "kl-2", "net3"]
 Environment = Literal["staging", "production"]
 Team = Literal["Backend", "Frontend", "DC/ML"]
 
@@ -84,6 +84,10 @@ class DeploymentRequest(Document):
     # at generate-manifests.sh time" (the historical default). True/False
     # force the spec.needsIngress flag explicitly.
     needs_ingress: Optional[bool] = Field(default=None, alias="needsIngress")
+    # Opt-in Infisical scope bootstrap. See services/infisical.py — Pulse
+    # ensures project + env + folder on approve, and the polyworkload
+    # generator emits an InfisicalSecret patch per env directory.
+    secrets_enabled: bool = Field(default=False, alias="secretsEnabled")
 
     # Retry / build tracking. `attempt` is the count of Jenkins claims for
     # this env record (1 on first dispatch, ++ on every retry). `latest_*`
@@ -93,6 +97,12 @@ class DeploymentRequest(Document):
     attempt: int = 1
     latest_job_id: Optional[str] = None
     latest_build_id: Optional[str] = None
+    # Cached failure context — mirrors the latest DeploymentEvent for the
+    # current build so a page load doesn't have to fan out into the event
+    # log just to render the current tracker state. Cleared on retry.
+    latest_log_excerpt: Optional[str] = None
+    latest_jenkins_build_url: Optional[str] = None
+    latest_jenkins_console_url: Optional[str] = None
 
     # Request type. `new` (default) = the normal new-app submission flow.
     # `add_worker` = a follow-up request that appends a worker to an

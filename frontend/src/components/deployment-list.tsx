@@ -79,7 +79,13 @@ function hostFor(d: Deployment, env: string): string {
 }
 
 export function DeploymentList() {
-  const { data: deployments, mutate } = useSWR<Deployment[]>("/api/deployments");
+  // Poll every 5s so Jenkins callback status updates show up on the admin
+  // list without a manual refresh. Matches the tracker page's 5s poll —
+  // no reason for the admin view to be more stale than the public one.
+  const { data: deployments, mutate } = useSWR<Deployment[]>(
+    "/api/deployments",
+    { refreshInterval: 5000, revalidateOnFocus: true },
+  );
   const [busyId, setBusyId] = useState<string | null>(null);
   const [actionError, setActionError] = useState("");
   const [expandedId, setExpandedId] = useState<string | null>(null);

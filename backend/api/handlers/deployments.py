@@ -2,6 +2,7 @@ import re
 import traceback
 import uuid
 from datetime import datetime, timezone
+from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 
@@ -47,14 +48,17 @@ REGISTRY = "zen0hub"
 _CLUSTER_TOLERATIONS = {
     "kl-1": [{"key": "proj", "operator": "Equal", "value": "salina", "effect": "NoSchedule"}],
     "kl-2": [{"key": "dept", "operator": "Equal", "value": "dc", "effect": "NoSchedule"}],
+    # net3 mirrors kl-2 (DC/ML pattern). Landed with the net3 ApplicationSet.
+    "net3": [{"key": "dept", "operator": "Equal", "value": "dc", "effect": "NoSchedule"}],
 }
 
-# Per-cluster ArgoCD UI base. kl-1 has a public ingress; kl-2 ArgoCD is only
-# reachable on the cluster LAN via NodePort. UI links are computed here so a
-# central change doesn't require touching every frontend that renders them.
+# Per-cluster ArgoCD UI base. kl-1 has a public ingress; kl-2/net3 ArgoCD are
+# only reachable on the cluster LAN via NodePort. UI links are computed here
+# so a central change doesn't require touching every frontend that renders them.
 _ARGOCD_BASE = {
     "kl-1": "https://argocd-kl.media-meter.in",
     "kl-2": "http://192.168.12.16:30443",
+    "net3": "https://192.168.3.28:30247",
 }
 
 
@@ -72,9 +76,10 @@ def _argocd_links(cluster: str, app: str, environments: list[str]) -> dict[str, 
 
 
 def _host_aliases_for(cluster: str) -> list[dict]:
-    """Mongo + arbiter hostAliases per cluster. kl-1 and kl-2 share the
-    192.168.10.0/24 mongo network — replica set members at .10–.13, arbiter at .33."""
-    if cluster not in ("kl-1", "kl-2"):
+    """Mongo + arbiter hostAliases per cluster. kl-1, kl-2, and net3 all share
+    the 192.168.10.0/24 mongo network — replica set members at .10–.13,
+    arbiter at .33."""
+    if cluster not in ("kl-1", "kl-2", "net3"):
         return []
     return [
         {"ip": "192.168.10.10", "hostnames": ["mongodb1"]},
@@ -134,6 +139,13 @@ def _build_jenkins_spec(d: DeploymentRequest) -> dict:
         "env_vars": d.env_vars or {},
         "tolerations": _CLUSTER_TOLERATIONS.get(d.cluster, []),
         "hostAliases": _host_aliases_for(d.cluster),
+        # Infisical scope. When enabled the generator emits an
+        # InfisicalSecret CR patch under environments/<env>/. Project
+        # slug follows the same hyphenated convention as `app` so a
+        # dev browsing the Infisical UI can match the repo at a
+        # glance.
+        "secretsEnabled": bool(d.secrets_enabled),
+        "infisicalProjectSlug": d.repo_slug.replace("_", "-"),
     }
     # ScaledJob multi-worker spec: emit only when present so the generator's
     # dispatch (`spec.workers // empty`) routes to scaledjob-multi.sh.
@@ -226,6 +238,7 @@ def serialize(d: DeploymentRequest) -> dict:
         "submissionId": d.submission_id,
         "workers": d.workers,
         "needsIngress": d.needs_ingress,
+        "secretsEnabled": bool(d.secrets_enabled),
         "createdAt": d.created_at.isoformat(),
     }
 
@@ -258,6 +271,11 @@ def serialize_public(d: DeploymentRequest) -> dict:
         "trackToken": d.track_token,
         "submissionId": d.submission_id,
         "createdAt": d.created_at.isoformat(),
+        "attempt": int(d.attempt or 1),
+        "latestBuildId": d.latest_build_id,
+        "latestLogExcerpt": d.latest_log_excerpt,
+        "latestJenkinsBuildUrl": d.latest_jenkins_build_url,
+        "latestJenkinsConsoleUrl": d.latest_jenkins_console_url,
     }
 
 
@@ -398,11 +416,75 @@ async def track_deployment_events(token: str):
             "jobId": e.job_id,
             "ts": e.ts.isoformat(),
             "error": e.error,
+            "logExcerpt": e.log_excerpt,
+            "jenkinsBuildUrl": e.jenkins_build_url,
+            "jenkinsConsoleUrl": e.jenkins_console_url,
         })
     return {
         "primaryToken": token,
         "submissionId": dep.submission_id,
         "timelines": grouped,
+    }
+
+
+@router.get("/track/{token}/console")
+async def track_deployment_console(token: str, start: int = 0):
+    """Proxy Jenkins's progressiveText log for the current build.
+
+    Frontend polls with the last `offset` it received; server returns
+    only the new bytes since then + a `more` flag. Jenkins is hit
+    server-side so no admin creds leak to the browser.
+
+    Returns:
+      - 200 with { text, offset, more, buildNumber } on success
+      - 200 with { text: "", offset: 0, more: false, buildNumber: null }
+        when the build hasn't been created yet (Jenkins job not scanned).
+        The frontend treats that as a no-op tick.
+    """
+    from services import jenkins_console
+
+    dep = await DeploymentRequest.find_one(DeploymentRequest.track_token == token)
+    if not dep:
+        raise HTTPException(status_code=404, detail="Tracking link not found")
+
+    # Tag derivation matches _build_jenkins_spec's tag semantics: alpha
+    # for staging, plain for prod. Only single-env records supported here
+    # — multi-env deployments would need a query param to disambiguate.
+    env = dep.environments[0] if dep.environments else "staging"
+    tag = "v0.0.0-alpha" if env == "staging" else "v0.0.0"
+    # If args carries a specific tag (later builds after v0.0.0-alpha),
+    # prefer it. Falls back to bootstrap tag otherwise.
+    if isinstance(dep.args, dict) and dep.args.get("tag"):
+        tag = dep.args["tag"]
+
+    build_number: Optional[int] = None
+    if dep.latest_build_id:
+        try:
+            build_number = int(dep.latest_build_id)
+        except (TypeError, ValueError):
+            build_number = None
+    if build_number is None:
+        build_number = await jenkins_console.fetch_last_build_number(
+            dep.repo_slug, tag
+        )
+    if build_number is None:
+        return {
+            "text": "",
+            "offset": 0,
+            "more": False,
+            "buildNumber": None,
+            "tag": tag,
+        }
+
+    text, offset, more = await jenkins_console.fetch_progressive_log(
+        dep.repo_slug, tag, build_number, max(0, int(start))
+    )
+    return {
+        "text": text,
+        "offset": offset,
+        "more": more,
+        "buildNumber": build_number,
+        "tag": tag,
     }
 
 
@@ -608,6 +690,7 @@ async def create_deployment(body: CreateDeploymentRequest):
             components=parsed_components,
             image_target=parsed_image_target,
             needs_ingress=body.needs_ingress,
+            secrets_enabled=body.secrets_enabled,
         )
         await dep.insert()
         created.append(dep)
@@ -851,6 +934,35 @@ async def approve_deployment(
 
     # Live dispatch — phase 1. Stops at tags_pushed; the completed stage waits
     # for Jenkins to call back (phase 2).
+    # Infisical scope bootstrap. Runs BEFORE tag push so that the
+    # InfisicalSecret CR emitted by the manifest generator finds an
+    # existing project/env/folder when the operator reconciles. Soft
+    # failure — a temporarily unhealthy Infisical shouldn't block the
+    # deploy; the operator will re-sync once the folder appears.
+    if dep.secrets_enabled:
+        try:
+            from services import infisical
+            comps = dep.components or [{"name": "api"}]
+            comp_paths = [f"/{c.get('name','api')}" for c in comps]
+            project_slug = dep.repo_slug.replace("_", "-")
+            await infisical.bootstrap_scope(
+                project_slug=project_slug,
+                project_name=dep.repo_slug,
+                envs=list(dep.environments),
+                paths=comp_paths,
+            )
+            print(
+                f"[DEPLOYMENT DISPATCH] {dep.repo_slug} infisical scope ready"
+                f" project={project_slug} envs={dep.environments} paths={comp_paths}",
+                flush=True,
+            )
+        except Exception as infi_exc:
+            traceback.print_exc()
+            print(
+                f"[DEPLOYMENT DISPATCH] {dep.repo_slug} infisical skipped: {infi_exc}",
+                flush=True,
+            )
+
     try:
         webhook_result = await add_webhook(dep.repo_slug)
         print(
@@ -1134,6 +1246,18 @@ async def pipeline_callback(repo_slug: str, body: PipelineCallback):
         if body.status in _FAILURE_STATUSES and body.error:
             dep.error = body.error
 
+    # Snapshot the latest Jenkins context onto the DeploymentRequest so
+    # the tracker page renders without joining event log. Failure
+    # excerpts + Jenkins URLs are the common case a dev needs on load.
+    if body.build_id:
+        dep.latest_build_id = body.build_id
+    if body.log_excerpt:
+        dep.latest_log_excerpt = body.log_excerpt
+    if body.jenkins_build_url:
+        dep.latest_jenkins_build_url = body.jenkins_build_url
+    if body.jenkins_console_url:
+        dep.latest_jenkins_console_url = body.jenkins_console_url
+
     await dep.save()
 
     # Persist the stage transition + fan out on Kafka. Direct write (not
@@ -1154,12 +1278,15 @@ async def pipeline_callback(repo_slug: str, body: PipelineCallback):
             deployment_id=str(dep.id),
             slug=dep.repo_slug,
             env=body.env or (dep.environments[0] if dep.environments else ""),
-            build_id=getattr(body, "build_id", None) or dep.latest_build_id,
+            build_id=body.build_id or dep.latest_build_id,
             job_id=dep.latest_job_id,
             attempt=int(dep.attempt or 1),
             stage=stage_val,
             state=state_val,
             error=body.error,
+            log_excerpt=body.log_excerpt,
+            jenkins_build_url=body.jenkins_build_url,
+            jenkins_console_url=body.jenkins_console_url,
         ).insert()
     except Exception as evt_exc:
         if "duplicate key" not in str(evt_exc).lower():
@@ -1312,6 +1439,13 @@ async def retry_deployment(
     dep.attempt = int(dep.attempt or 1) + 1
     dep.status = "tags_pushed"
     dep.error = None
+    # Clear the previous attempt's Jenkins snapshot so a stale kaniko
+    # error from attempt N doesn't linger on the tracker page while
+    # attempt N+1 is still queuing.
+    dep.latest_log_excerpt = None
+    dep.latest_jenkins_build_url = None
+    dep.latest_jenkins_console_url = None
+    dep.latest_build_id = None
 
     # Re-publish spec (in case it was pruned) and enqueue on both queues.
     try:

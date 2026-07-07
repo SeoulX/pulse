@@ -1,15 +1,14 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { useParams } from "next/navigation";
 import { RefreshCw, ArrowLeft } from "lucide-react";
 
 import { API_URL } from "@/lib/api";
-import {
-  DeploymentProgressCard,
-  type ProgressCardData,
-} from "@/components/deployment-progress";
+import type { ProgressCardData } from "@/components/deployment-progress";
+import { DeploymentVerticalTracker } from "@/components/deployment-vertical-tracker";
+import { DeploymentConsoleTail } from "@/components/deployment-console-tail";
 
 const POLL_MS = 5000;
 const TERMINAL = new Set([
@@ -173,9 +172,33 @@ export default function TrackDeploymentPage() {
     }
   };
 
+  // Poll the activity feed while the deployment is still in flight so
+  // event flow matches the tracker card. Once terminal we stop refreshing
+  // both — the events log won't gain new rows.
+  const liveActivity = data ? !allEnvsTerminal(data) : true;
+
+  // Measure the tracker card so the console panel can render at the same
+  // pixel height. Grid stretch would fill either cell to the taller of
+  // the two — we want the console SPECIFICALLY pinned to the tracker's
+  // height so it never overflows below.
+  const gridRef = useRef<HTMLDivElement>(null);
+  const trackerRef = useRef<HTMLDivElement>(null);
+  const [trackerHeight, setTrackerHeight] = useState<number | null>(null);
+
+  useEffect(() => {
+    const el = trackerRef.current;
+    if (!el) return;
+    const ro = new ResizeObserver(() => {
+      setTrackerHeight(el.getBoundingClientRect().height);
+    });
+    ro.observe(el);
+    setTrackerHeight(el.getBoundingClientRect().height);
+    return () => ro.disconnect();
+  }, [data]);
+
   return (
     <div className="dot-grid min-h-screen bg-background">
-      <div className="mx-auto max-w-2xl px-6 py-12">
+      <div className="mx-auto max-w-6xl px-6 py-12">
         <div className="mb-6 flex items-center justify-between">
           <Link
             href="/deploy"
@@ -197,29 +220,72 @@ export default function TrackDeploymentPage() {
           </button>
         </div>
 
-        <div className="rounded-2xl border bg-card p-6 shadow-sm">
-          <div className="mb-4">
-            <h1 className="text-lg font-semibold">Deployment progress</h1>
-            <p className="text-xs text-muted-foreground">
-              Polling every {POLL_MS / 1000}s while this request is in flight.
-              Bookmark this page — the link never expires.
-            </p>
-          </div>
-
-          {loading && (
-            <div className="flex items-center justify-center py-12">
-              <div className="h-8 w-8 animate-spin rounded-full border-4 border-primary border-t-transparent" />
-            </div>
-          )}
-
-          {!loading && error && (
-            <div className="rounded-xl bg-red-50 p-3 text-sm text-red-700 dark:bg-red-900/20 dark:text-red-400">
-              {error}
-            </div>
-          )}
-
-          {!loading && !error && data && <DeploymentProgressCard data={data} />}
+        <div className="mb-3">
+          <h1 className="text-lg font-semibold">Deployment progress</h1>
+          <p className="text-xs text-muted-foreground">
+            Polling every {POLL_MS / 1000}s while this request is in flight.
+            Bookmark this page — the link never expires.
+          </p>
         </div>
+
+        {loading && (
+          <div className="flex items-center justify-center rounded-2xl border bg-card p-12">
+            <div className="h-8 w-8 animate-spin rounded-full border-4 border-primary border-t-transparent" />
+          </div>
+        )}
+
+        {!loading && error && (
+          <div className="rounded-2xl border bg-card p-4 text-sm text-red-700 dark:text-red-400">
+            {error}
+          </div>
+        )}
+
+        {/* Two-column layout: vertical tracker on the left, sticky
+            Jenkins live console on the right. CSS lines from the
+            Jenkins-owned stage rows extend into the console panel via
+            `data-connect-*` markers rendered inside the tracker. On
+            mobile the console stacks below the tracker. */}
+        {!loading && !error && data && token && (
+          <div
+            ref={gridRef}
+            className="grid grid-cols-1 items-start gap-6 md:grid-cols-[minmax(0,1fr)_minmax(0,1fr)]"
+          >
+            <div ref={trackerRef} className="relative">
+              <DeploymentVerticalTracker
+                data={data}
+                token={token}
+                live={liveActivity}
+              />
+            </div>
+            {/* Right panel height is measured from the tracker card so
+                the two cards read as the same size. Internal <pre>
+                scrolls when the log is longer than the panel. Using
+                align-items: start (items-start on the grid) prevents
+                the grid from stretching this cell to match the tallest
+                content — the height comes from the measured tracker
+                instead. */}
+            <div
+              className="flex flex-col overflow-hidden"
+              style={{ height: trackerHeight ? `${trackerHeight}px` : undefined }}
+            >
+              <div className="flex h-full flex-col rounded-2xl border-l-4 border-l-[#e8871e]/70 border-y border-r bg-card p-4 shadow-sm dark:border-l-[#2a7f9e]/70">
+                <div className="mb-2 flex items-center gap-2">
+                  <h2 className="text-sm font-semibold">Jenkins console</h2>
+                  <span className="rounded-md bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground">
+                    image_built → manifest → completed
+                  </span>
+                </div>
+                <p className="mb-3 text-[11px] text-muted-foreground">
+                  Live tail of the tag build. Streams while any of the
+                  Jenkins-owned stages on the left is in flight.
+                </p>
+                <div className="flex min-h-0 flex-1 flex-col">
+                  <DeploymentConsoleTail token={token} live={liveActivity} />
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );

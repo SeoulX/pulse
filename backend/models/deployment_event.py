@@ -34,6 +34,12 @@ class DeploymentEvent(Document):
     state: str
     error: Optional[str] = None
     tag: Optional[str] = None
+    # Failure context — see PipelineCallback for semantics. Copied into
+    # every event row (not just failure events) so the tracker page can
+    # link to Jenkins from a mid-build "still building" row too.
+    log_excerpt: Optional[str] = None
+    jenkins_build_url: Optional[str] = None
+    jenkins_console_url: Optional[str] = None
 
     ts: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 

@@ -250,7 +250,7 @@ async def fetch_repo_file(repo_slug: str, path: str) -> str | None:
             return r.text if r.status_code == 200 else None
     except Exception:
         return None
-_CLUSTERS_TO_SCAN = ("kl-1", "kl-2")
+_CLUSTERS_TO_SCAN = ("kl-1", "kl-2", "net3")
 _ENVS_TO_SCAN = ("staging", "production")
 
 # Any of these in package.json deps/devDeps marks the repo as a UI workload.

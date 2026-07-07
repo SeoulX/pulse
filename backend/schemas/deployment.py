@@ -5,7 +5,7 @@ from pydantic import BaseModel, EmailStr, Field
 
 WorkloadKind = Literal["Deployment", "StatefulSet", "ScaledJob", "CronJob"]
 DeploymentRole = Literal["API", "UI", "Worker", "Streamlit"]
-Cluster = Literal["kl-1", "kl-2"]
+Cluster = Literal["kl-1", "kl-2", "net3"]
 Environment = Literal["staging", "production"]
 Team = Literal["Backend", "Frontend", "DC/ML"]
 
@@ -38,6 +38,11 @@ class CreateDeploymentRequest(BaseModel):
     # on the DeploymentRequest; the manifest generator reads
     # spec.needsIngress at bootstrap time.
     needs_ingress: Optional[bool] = None
+    # Opt-in for Infisical scope bootstrap. When true, `approve_deployment`
+    # ensures project + env + folder in Infisical before pushing the tag,
+    # and the manifest generator emits an InfisicalSecret CR + kustomize
+    # patch for each per-env directory.
+    secrets_enabled: bool = False
     # Container args per child. Keys: "server", "worker". Empty/missing = image CMD.
     # Tokens split on whitespace by the bootstrap script (one arg per token).
     args: Dict[str, str] = Field(default_factory=dict)
@@ -109,3 +114,13 @@ class PipelineCallback(BaseModel):
     # the handler falls back to updating the legacy aggregate status only.
     env: Optional[Environment] = None
     error: Optional[str] = None
+    # Extended failure context. `log_excerpt` is the tail of the failing
+    # step's output (kaniko, pytest, trivy…) up to 3KB — enough to
+    # diagnose common causes without needing the tracker page to iframe
+    # the whole Jenkins console. `jenkins_build_url` + `_console_url`
+    # link out for the full log. `build_id` is Jenkins's BUILD_NUMBER so
+    # a stage retry can distinguish attempts of the same tag.
+    log_excerpt: Optional[str] = None
+    jenkins_build_url: Optional[str] = None
+    jenkins_console_url: Optional[str] = None
+    build_id: Optional[str] = None

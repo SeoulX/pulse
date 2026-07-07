@@ -1,7 +1,17 @@
 "use client";
 
-import { Fragment } from "react";
-import { Check, CircleDashed, Loader2, X, Trash2, ExternalLink } from "lucide-react";
+import { Fragment, useState } from "react";
+import {
+  Check,
+  CircleDashed,
+  Loader2,
+  X,
+  Trash2,
+  ExternalLink,
+  Terminal,
+  ChevronDown,
+  ChevronRight,
+} from "lucide-react";
 
 import type { SubmittedDeployment } from "@/components/deployment-form";
 
@@ -127,6 +137,14 @@ export interface ProgressCardData {
   approvedAt?: string | null;
   rejectionReason?: string | null;
   error?: string | null;
+  // Jenkins failure context populated by pipeline_callback. These are per
+  // record (per env) — the merge in tracker/page.tsx keeps them on each
+  // record.
+  attempt?: number;
+  latestBuildId?: string | null;
+  latestLogExcerpt?: string | null;
+  latestJenkinsBuildUrl?: string | null;
+  latestJenkinsConsoleUrl?: string | null;
 }
 
 interface EnvTrackerProps {
@@ -135,16 +153,38 @@ interface EnvTrackerProps {
   error?: string;
   argocdLink?: string;
   rejectionReason?: string | null;
+  logExcerpt?: string | null;
+  jenkinsBuildUrl?: string | null;
+  jenkinsConsoleUrl?: string | null;
+  attempt?: number;
 }
 
-function EnvTracker({ env, status, error, argocdLink, rejectionReason }: EnvTrackerProps) {
+function EnvTracker({
+  env,
+  status,
+  error,
+  argocdLink,
+  rejectionReason,
+  logExcerpt,
+  jenkinsBuildUrl,
+  jenkinsConsoleUrl,
+  attempt,
+}: EnvTrackerProps) {
   const { reached, failed, failedAt } = stageForStatus(status);
+  const [showLog, setShowLog] = useState(false);
   return (
     <div className="space-y-2">
       <div className="flex items-center justify-between gap-2">
-        <span className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-          {env}
-        </span>
+        <div className="flex items-center gap-2">
+          <span className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+            {env}
+          </span>
+          {typeof attempt === "number" && attempt > 1 && (
+            <span className="rounded-md bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground">
+              attempt {attempt}
+            </span>
+          )}
+        </div>
         <span
           className={`rounded-lg px-2 py-0.5 text-[10px] font-medium ${statusPill(status)}`}
         >
@@ -160,6 +200,13 @@ function EnvTracker({ env, status, error, argocdLink, rejectionReason }: EnvTrac
           const failTooltip = isFail
             ? error || rejectionReason || `Failed at ${stage.label}`
             : undefined;
+          // Animated connector: the line BEFORE the current stage flows
+          // orange→transparent left-to-right, giving the sense of "the
+          // build is still working on reaching the next step". Failure
+          // connector goes solid red. Done connectors are solid orange.
+          // Untouched connectors are the default border grey.
+          const connectorIsAnimated = isCurrent && i - 1 === reached;
+          const connectorIsSolid = done && i - 1 < reached;
           return (
             <Fragment key={stage.key}>
               <div className="group relative flex min-w-0 flex-shrink-0 flex-col items-center gap-1.5">
@@ -209,30 +256,85 @@ function EnvTracker({ env, status, error, argocdLink, rejectionReason }: EnvTrac
                 </span>
               </div>
               {i < STAGES.length - 1 && (
-                <div
-                  className={`mx-1 mt-3 h-px flex-1 ${
-                    done && i < reached
-                      ? "bg-[#e8871e] dark:bg-[#2a7f9e]"
-                      : "bg-border"
-                  }`}
-                />
+                <div className="relative mx-1 mt-3 h-[2px] flex-1 overflow-hidden rounded-full bg-border">
+                  {connectorIsSolid && (
+                    <div className="absolute inset-0 bg-[#e8871e] dark:bg-[#2a7f9e]" />
+                  )}
+                  {connectorIsAnimated && (
+                    <div className="pulse-connector absolute inset-0" />
+                  )}
+                </div>
               )}
             </Fragment>
           );
         })}
       </div>
-      {status === "completed" && argocdLink && (
-        <a
-          href={argocdLink}
-          target="_blank"
-          rel="noreferrer"
-          className="inline-flex items-center gap-1 text-[11px] font-medium text-[#e8871e] hover:underline dark:text-[#5ab4c5]"
-        >
-          <ExternalLink className="h-3 w-3" />
-          Open in ArgoCD
-        </a>
+
+      {/* Action strip — Jenkins log links + ArgoCD when available. */}
+      {(jenkinsBuildUrl || argocdLink) && (
+        <div className="flex flex-wrap items-center gap-3 pt-1">
+          {status === "completed" && argocdLink && (
+            <a
+              href={argocdLink}
+              target="_blank"
+              rel="noreferrer"
+              className="inline-flex items-center gap-1 text-[11px] font-medium text-[#e8871e] hover:underline dark:text-[#5ab4c5]"
+            >
+              <ExternalLink className="h-3 w-3" />
+              Open in ArgoCD
+            </a>
+          )}
+          {jenkinsBuildUrl && (
+            <a
+              href={jenkinsBuildUrl}
+              target="_blank"
+              rel="noreferrer"
+              className="inline-flex items-center gap-1 text-[11px] text-muted-foreground hover:text-[#e8871e] hover:underline dark:hover:text-[#5ab4c5]"
+            >
+              <ExternalLink className="h-3 w-3" />
+              Jenkins build
+            </a>
+          )}
+          {jenkinsConsoleUrl && (
+            <a
+              href={jenkinsConsoleUrl}
+              target="_blank"
+              rel="noreferrer"
+              className="inline-flex items-center gap-1 text-[11px] text-muted-foreground hover:text-[#e8871e] hover:underline dark:hover:text-[#5ab4c5]"
+            >
+              <Terminal className="h-3 w-3" />
+              Full console log
+            </a>
+          )}
+        </div>
       )}
-      {error && !argocdLink && (
+
+      {/* Failure detail card — expandable, monospace, whitespace preserved.
+          When log_excerpt is present prefer it over the short error string;
+          the excerpt is the tail of the actual failing step's output. */}
+      {failed && (logExcerpt || error) && (
+        <div className="mt-2 rounded-lg border border-red-200 bg-red-50 p-2 dark:border-red-900/50 dark:bg-red-950/30">
+          <button
+            type="button"
+            onClick={() => setShowLog((v) => !v)}
+            className="flex w-full items-center gap-1.5 text-left text-[11px] font-medium text-red-700 dark:text-red-300"
+          >
+            {showLog ? (
+              <ChevronDown className="h-3 w-3" />
+            ) : (
+              <ChevronRight className="h-3 w-3" />
+            )}
+            {logExcerpt ? "Show failing step output" : "Show error"}
+          </button>
+          {showLog && (
+            <pre className="mt-2 max-h-72 overflow-auto rounded-md bg-red-100/60 p-2 font-mono text-[11px] leading-tight text-red-900 dark:bg-red-900/40 dark:text-red-100">
+              {logExcerpt || error}
+            </pre>
+          )}
+        </div>
+      )}
+
+      {error && !failed && !jenkinsBuildUrl && (
         <p className="text-[11px] text-red-500">{error}</p>
       )}
     </div>
@@ -287,6 +389,10 @@ export function DeploymentProgressCard({ data }: { data: ProgressCardData }) {
               error={data.envErrors?.[env] ?? undefined}
               argocdLink={data.argocdLinks?.[env]}
               rejectionReason={data.rejectionReason}
+              logExcerpt={data.latestLogExcerpt}
+              jenkinsBuildUrl={data.latestJenkinsBuildUrl}
+              jenkinsConsoleUrl={data.latestJenkinsConsoleUrl}
+              attempt={data.attempt}
             />
           ))
         ) : (
@@ -301,6 +407,10 @@ export function DeploymentProgressCard({ data }: { data: ProgressCardData }) {
               data.argocdLinks?.[data.environments[0] ?? ""] ?? undefined
             }
             rejectionReason={data.rejectionReason}
+            logExcerpt={data.latestLogExcerpt}
+            jenkinsBuildUrl={data.latestJenkinsBuildUrl}
+            jenkinsConsoleUrl={data.latestJenkinsConsoleUrl}
+            attempt={data.attempt}
           />
         )}
       </div>

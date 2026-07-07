@@ -32,16 +32,6 @@ export default function DeployLayout({ children }: { children: React.ReactNode }
         </div>
       </header>
 
-      <section className="border-b bg-gradient-to-b from-[#e8871e]/10 to-transparent px-10 pb-4 pt-5 dark:from-[#fbbf24]/10">
-        <div className="mx-auto max-w-[1400px]">
-          <h1 className="text-xl font-bold tracking-tight">Request a deployment</h1>
-          <p className="text-sm text-muted-foreground">
-            DevOps reviews each request. You&apos;ll get a tracking link — no
-            login required to follow progress.
-          </p>
-        </div>
-      </section>
-
       <main className="mx-auto w-full max-w-[1400px] flex-1 px-10 py-6">
         {children}
       </main>

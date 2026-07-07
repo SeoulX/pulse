@@ -113,7 +113,7 @@ const TEAMS = [
   { value: "DC/ML", label: "DC/ML" },
 ] as const;
 
-const CLUSTERS = ["kl-1", "kl-2"] as const;
+const CLUSTERS = ["kl-1", "kl-2", "net3"] as const;
 
 const ENVIRONMENTS = [
   { value: "staging", label: "staging", tag: "v0.0.0-alpha" },
@@ -314,8 +314,12 @@ export function DeploymentForm({ onSubmitted }: DeploymentFormProps = {}) {
   // Ingress is opt-in / opt-out — defaults to true for role=API/UI/Streamlit,
   // false for Worker/ScaledJob/CronJob. Tracked separately from role so the
   // user can override either way after picking a role.
-  const [needsIngress, setNeedsIngress] = useState(true);
+  const [needsIngress, setNeedsIngress] = useState(false);
   const [ingressTouched, setIngressTouched] = useState(false);
+  // Infisical scope bootstrap — checked by default (org convention is
+  // Infisical-managed secrets on every new repo). Devs uncheck for
+  // internal-only workloads that don't need a scoped secret store.
+  const [secretsEnabled, setSecretsEnabled] = useState(true);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   // SEV: a single form submit can create N records (one per env). We keep
@@ -392,14 +396,10 @@ export function DeploymentForm({ onSubmitted }: DeploymentFormProps = {}) {
     if (portDef) setPort(portDef);
   }, [role, repoInspection?.inferred_default_port]);
 
-  // Default needsIngress from the role — API/UI/Streamlit get true, Worker
-  // gets false (no public HTTP path). Skip once the user has toggled the
-  // checkbox manually so we don't fight their choice.
-  useEffect(() => {
-    if (ingressTouched) return;
-    const ingressByRole = role === "API" || role === "UI" || role === "Streamlit";
-    setNeedsIngress(ingressByRole);
-  }, [role, ingressTouched]);
+  // needsIngress starts OFF by design. Devs opt in explicitly rather
+  // than getting a role-based auto-check that they'd have to un-tick
+  // for internal-only workloads. The old role → auto-check effect
+  // was removed 2026-07-06 per form redesign.
 
   // Roles that are HTTP servers → always Deployment. (UI is also in this
   // set but the Frontend team lock already handles it; listing it here is
@@ -689,6 +689,7 @@ export function DeploymentForm({ onSubmitted }: DeploymentFormProps = {}) {
           // Force false on submit so a stale form-state default can't slip
           // through and trigger an ingress + cert that nothing routes to.
           needs_ingress: isScaledJob ? false : needsIngress,
+          secrets_enabled: secretsEnabled,
         }),
       });
 
@@ -1248,6 +1249,26 @@ git push origin main`}
               </span>
             </label>
             )}
+
+            {/* Infisical scope opt-in. On approve, Pulse creates the
+                project + env + folder in Infisical automatically, and
+                the manifest generator emits an InfisicalSecret CR per
+                component. Dev then populates secret VALUES in the
+                Infisical UI. */}
+            <label className="flex items-center gap-2 text-sm">
+              <input
+                type="checkbox"
+                checked={secretsEnabled}
+                onChange={(e) => setSecretsEnabled(e.target.checked)}
+                className="h-4 w-4 rounded border-border accent-[#e8871e]"
+              />
+              <span>
+                Provision Infisical secret scope
+                <span className="ml-1 text-xs italic text-muted-foreground">
+                  (project + env + folder auto-created; values go in Infisical UI)
+                </span>
+              </span>
+            </label>
 
             <PillRow
               label="Cluster"
