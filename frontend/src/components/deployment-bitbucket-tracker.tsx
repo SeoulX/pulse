@@ -626,7 +626,7 @@ export function DeploymentBitbucketTracker({
                     onClick={() => {
                       autoActiveRef.current = false;
                       setActiveStageKey(stage.key);
-                      setExpandedRow(null);
+                      setManualToggles({});
                     }}
                     className={`flex w-full items-center gap-2 border-l-2 px-3 py-2 text-left transition-colors ${
                       active
