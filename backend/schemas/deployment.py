@@ -124,3 +124,7 @@ class PipelineCallback(BaseModel):
     jenkins_build_url: Optional[str] = None
     jenkins_console_url: Optional[str] = None
     build_id: Optional[str] = None
+    # Tag name that fired this build (e.g. v0.1.3-alpha). Jenkins ships
+    # $TAG_NAME. Needed so orphan-tag callbacks (dev pushed a tag outside
+    # the Pulse form flow) can synthesize a Deployment record + tracker.
+    tag: Optional[str] = None

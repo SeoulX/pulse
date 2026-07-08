@@ -110,6 +110,15 @@ class DeploymentRequest(Document):
     # everything in one collection so the same tracker + Discord +
     # approval path covers both.
     kind: str = Field(default="new")
+    # Where this record came from. `form` = dev submitted via Pulse UI.
+    # `manual_tag` = Jenkins fired a callback for a tag pushed outside
+    # the Pulse flow; callback auto-created a synthetic record so the
+    # build gets a tracker URL + shows up in the repo browser.
+    origin: str = Field(default="form")
+    # Tag name populated on manual_tag records (Jenkins reports it in the
+    # callback). Optional on form records — the tag isn't stable until
+    # push_tag runs at approve time.
+    tag: Optional[str] = None
     # Set when kind="add_worker": {component, worker, max, batch, list_name?}.
     # None for kind="new". Approve flow reads this to patch workers.yml
     # and push the next alpha tag.

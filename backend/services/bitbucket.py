@@ -775,6 +775,32 @@ async def list_tags(repo_slug: str) -> list[str]:
         return []
 
 
+async def list_tags_detailed(repo_slug: str) -> list[dict]:
+    """Same as list_tags but keeps each tag's target commit date + hash.
+
+    Used by the deployment backfill flow (services/deployments) to
+    reconstruct historical build records the Pulse DB never captured.
+    Result: [{name, date (ISO 8601 str or None), hash}]. Empty on error.
+    """
+    try:
+        async with httpx.AsyncClient(auth=_auth(), timeout=15) as client:
+            resp = await _retry_request(
+                client, "GET", _api(f"{repo_slug}/refs/tags?pagelen=100")
+            )
+            resp.raise_for_status()
+            out: list[dict] = []
+            for t in resp.json().get("values", []):
+                target = t.get("target") or {}
+                out.append({
+                    "name": t.get("name"),
+                    "date": target.get("date"),
+                    "hash": target.get("hash"),
+                })
+            return out
+    except Exception:
+        return []
+
+
 async def commit_file(
     repo_slug: str,
     file_path: str,

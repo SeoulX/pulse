@@ -27,6 +27,7 @@ from services.bitbucket import (
     fetch_repo_file,
     inspect_repo,
     list_tags,
+    list_tags_detailed,
     next_alpha_tag,
     parse_repo_slug,
     push_tag,
@@ -276,7 +277,21 @@ def serialize_public(d: DeploymentRequest) -> dict:
         "latestLogExcerpt": d.latest_log_excerpt,
         "latestJenkinsBuildUrl": d.latest_jenkins_build_url,
         "latestJenkinsConsoleUrl": d.latest_jenkins_console_url,
+        "origin": getattr(d, "origin", "form"),
+        # Fall back to the bootstrap tag the pipeline pushes for this env
+        # so old form records (predating the tag field) still render a
+        # value. Overwrites on real callback via `dep.tag` update path.
+        "tag": getattr(d, "tag", None) or _bootstrap_tag_for(d),
     }
+
+
+def _bootstrap_tag_for(d: DeploymentRequest) -> Optional[str]:
+    env = d.environments[0] if d.environments else None
+    if env == "staging":
+        return "v0.0.0-alpha"
+    if env == "production":
+        return "v0.0.0"
+    return None
 
 
 async def _build_planned(dep: DeploymentRequest) -> dict:
@@ -340,6 +355,179 @@ async def list_deployments(admin: User = Depends(require_admin)):
     """Admin-only: monitor submitted deployment requests."""
     docs = await DeploymentRequest.find_all().sort("-createdAt").to_list()
     return [serialize(d) for d in docs]
+
+
+@router.get("/repos")
+async def list_repos(limit: int = 50):
+    """Public: distinct repo slugs with latest-build summary. Powers the
+    /deploy landing repo grid.
+
+    Aggregation: bucket by repo_slug, take max(createdAt) as latest, plus
+    counts. Cheap on our data volume (< 1k rows). Skips manual_tag
+    entries with no meaningful metadata.
+    """
+    # Beanie stores fields under their JSON alias (camelCase) in Mongo,
+    # so grouping keys must be the camelCase names — `$repoSlug`,
+    # `$trackToken`, `$createdAt`, not the Python snake_case attributes.
+    pipeline = [
+        {"$sort": {"createdAt": -1}},
+        {
+            "$group": {
+                "_id": "$repoSlug",
+                "latest_status": {"$first": "$status"},
+                "latest_env": {"$first": {"$arrayElemAt": ["$environments", 0]}},
+                "latest_tag": {"$first": "$tag"},
+                "latest_cluster": {"$first": "$cluster"},
+                "latest_created_at": {"$first": "$createdAt"},
+                "latest_track_token": {"$first": "$trackToken"},
+                "total": {"$sum": 1},
+            }
+        },
+        {"$sort": {"latest_created_at": -1}},
+        {"$limit": max(1, min(limit, 200))},
+    ]
+    coll = DeploymentRequest.get_motor_collection()
+    docs = await coll.aggregate(pipeline).to_list(length=limit)
+    return [
+        {
+            "repoSlug": d["_id"],
+            "latestStatus": d.get("latest_status"),
+            "latestEnv": d.get("latest_env"),
+            "latestTag": d.get("latest_tag"),
+            "latestCluster": d.get("latest_cluster"),
+            "latestCreatedAt": (
+                d["latest_created_at"].isoformat()
+                if d.get("latest_created_at")
+                else None
+            ),
+            "latestTrackToken": d.get("latest_track_token"),
+            "total": d.get("total", 0),
+        }
+        for d in docs
+    ]
+
+
+_ALPHA_TAG_RE = re.compile(r"^v\d+\.\d+\.\d+-alpha$")
+_PROD_TAG_RE = re.compile(r"^v\d+\.\d+\.\d+$")
+
+
+def _env_for_tag(tag: str) -> Optional[str]:
+    if _ALPHA_TAG_RE.match(tag):
+        return "staging"
+    if _PROD_TAG_RE.match(tag):
+        return "production"
+    return None
+
+
+async def _backfill_repo_logic(repo_slug: str) -> dict:
+    tags = await list_tags_detailed(repo_slug)
+    if not tags:
+        return {"repoSlug": repo_slug, "inserted": 0, "skipped": 0, "reason": "no tags"}
+
+    existing = await DeploymentRequest.find(
+        DeploymentRequest.repo_slug == repo_slug
+    ).to_list()
+    # (env, tag) → dep. `tag` may be null on old records; fall back to
+    # the bootstrap tag for the env so we don't double-insert v0.0.0-alpha
+    # against a legacy staging row that lacks a tag value.
+    known: set[tuple[str, str]] = set()
+    for d in existing:
+        env = d.environments[0] if d.environments else None
+        if not env:
+            continue
+        real_tag = d.tag or _bootstrap_tag_for(d)
+        if real_tag:
+            known.add((env, real_tag))
+
+    inserted = 0
+    skipped = 0
+    workspace = settings.BITBUCKET_WORKSPACE
+    for t in tags:
+        name = t.get("name") or ""
+        env = _env_for_tag(name)
+        if not env:
+            skipped += 1
+            continue
+        if (env, name) in known:
+            skipped += 1
+            continue
+        raw_date = t.get("date")
+        try:
+            created_at = (
+                datetime.fromisoformat(raw_date.replace("Z", "+00:00"))
+                if raw_date
+                else datetime.now(timezone.utc)
+            )
+        except Exception:
+            created_at = datetime.now(timezone.utc)
+
+        dep = DeploymentRequest(
+            repo_slug=repo_slug,
+            repo_url=f"https://bitbucket.org/{workspace}/{repo_slug}.git",
+            team="Backend",
+            workload_kind="Deployment",
+            role=None,
+            cluster="kl-1",
+            environments=[env],
+            env_vars={},
+            domain_zone="media-meter.in",
+            requested_by="backfill@pulse",
+            status="completed",
+            origin="manual_tag",
+            tag=name,
+            created_at=created_at,
+        )
+        await dep.insert()
+        inserted += 1
+
+    return {
+        "repoSlug": repo_slug,
+        "inserted": inserted,
+        "skipped": skipped,
+        "totalTags": len(tags),
+    }
+
+
+@router.post("/repo/{repo_slug}/backfill")
+async def backfill_repo(repo_slug: str, admin: User = Depends(require_admin)):
+    """Admin-only: pull all Bitbucket tags for a repo, create synthetic
+    manual_tag records for tags Pulse doesn't know. Idempotent."""
+    return await _backfill_repo_logic(repo_slug)
+
+
+@router.post("/backfill")
+async def backfill_all(admin: User = Depends(require_admin)):
+    """Admin-only: backfill every repo Pulse knows about, serialized."""
+    coll = DeploymentRequest.get_motor_collection()
+    slugs = await coll.distinct("repoSlug")
+    results = []
+    for slug in slugs:
+        try:
+            r = await _backfill_repo_logic(slug)
+            results.append(r)
+        except Exception as e:
+            results.append({"repoSlug": slug, "error": str(e)})
+    total_inserted = sum(r.get("inserted", 0) for r in results)
+    return {"repos": len(slugs), "inserted": total_inserted, "results": results}
+
+
+@router.get("/repo/{repo_slug}")
+async def list_repo_builds(repo_slug: str, limit: int = 50, skip: int = 0):
+    """Public: all builds for one repo, newest first. Bitbucket-style
+    build history. Reused by /deploy/repo/[slug] to render a build table.
+    """
+    docs = (
+        await DeploymentRequest.find(DeploymentRequest.repo_slug == repo_slug)
+        .sort("-createdAt")
+        .skip(max(0, skip))
+        .limit(max(1, min(limit, 200)))
+        .to_list()
+    )
+    return {
+        "repoSlug": repo_slug,
+        "count": len(docs),
+        "builds": [serialize_public(d) for d in docs],
+    }
 
 
 @router.get("/track/{token}")
@@ -1210,12 +1398,44 @@ async def pipeline_callback(repo_slug: str, body: PipelineCallback):
         )
 
     if not dep:
-        print(
-            f"[PIPELINE CALLBACK] {repo_slug} status={body.status}"
-            f" env={body.env or '?'} — no active deployment to advance",
-            flush=True,
-        )
-        return {"matched": False, "repoSlug": repo_slug}
+        # Orphan-tag path: no matching form-submitted deployment. Auto-
+        # create a synthetic record so the build has a tracker URL + shows
+        # up in the repo browser. Only fires when both env + tag are
+        # populated (older Jenkinsfiles without `tag` in the callback body
+        # keep the legacy "no match" no-op).
+        if body.env and body.tag:
+            dep = DeploymentRequest(
+                repo_slug=repo_slug,
+                repo_url=f"https://bitbucket.org/{settings.BITBUCKET_WORKSPACE}/{repo_slug}.git",
+                team="Backend",
+                workload_kind="Deployment",
+                role=None,
+                cluster="kl-1",
+                environments=[body.env],
+                env_vars={},
+                domain_zone="media-meter.in",
+                requested_by="jenkins@ci",
+                status=body.status,
+                origin="manual_tag",
+                tag=body.tag,
+                latest_build_id=body.build_id,
+                latest_log_excerpt=body.log_excerpt,
+                latest_jenkins_build_url=body.jenkins_build_url,
+                latest_jenkins_console_url=body.jenkins_console_url,
+            )
+            await dep.insert()
+            print(
+                f"[PIPELINE CALLBACK] {repo_slug} tag={body.tag} env={body.env}"
+                f" — orphan-tag record synthesized (id={dep.id})",
+                flush=True,
+            )
+        else:
+            print(
+                f"[PIPELINE CALLBACK] {repo_slug} status={body.status}"
+                f" env={body.env or '?'} — no active deployment to advance",
+                flush=True,
+            )
+            return {"matched": False, "repoSlug": repo_slug}
 
     if body.env:
         # SEV: single-env records map status directly — no aggregate needed,
@@ -1249,6 +1469,8 @@ async def pipeline_callback(repo_slug: str, body: PipelineCallback):
     # Snapshot the latest Jenkins context onto the DeploymentRequest so
     # the tracker page renders without joining event log. Failure
     # excerpts + Jenkins URLs are the common case a dev needs on load.
+    if body.tag and not dep.tag:
+        dep.tag = body.tag
     if body.build_id:
         dep.latest_build_id = body.build_id
     if body.log_excerpt:
