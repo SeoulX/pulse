@@ -102,6 +102,24 @@ async def ensure_project(slug: str, name: str) -> Optional[str]:
         return pid
 
 
+# Infisical bootstraps every new project with three default envs:
+#   dev / staging / prod. Passing `production` (or any other slug that
+# doesn't already exist) makes Infisical create a SECOND "Production"
+# entry with slug=production alongside the default slug=prod one — the
+# UI shows two Production tabs and the operator sees split-brain
+# secrets. Normalize before every Infisical call so we always target
+# the default set.
+_ENV_SLUG_MAP = {
+    "production": "prod",
+    "staging": "staging",
+    "development": "dev",
+}
+
+
+def _infisical_slug(env: str) -> str:
+    return _ENV_SLUG_MAP.get(env, env)
+
+
 async def ensure_environment(project_id: str, env_slug: str, env_name: Optional[str] = None) -> bool:
     """Create the env if missing. 400/409 from Infisical typically means
     already-exists (env slug collision) — treat as success."""
@@ -182,7 +200,10 @@ async def bootstrap_scope(
     pid = await ensure_project(project_slug, project_name)
     if not pid:
         return None
-    env_list = list(envs)
+    # Callers pass Pulse's env names (`staging`, `production`); normalize
+    # to Infisical's default slugs (`staging`, `prod`) so we don't create
+    # duplicate envs alongside the built-in ones.
+    env_list = [_infisical_slug(e) for e in envs]
     path_list = list(paths) or ["/"]
     for env in env_list:
         await ensure_environment(pid, env)
