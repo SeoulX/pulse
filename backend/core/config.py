@@ -77,6 +77,21 @@ class Settings(BaseSettings):
     INFISICAL_HOST_API: str = "https://infisical-kl.media-meter.in/api"
     INFISICAL_ADMIN_CLIENT_ID: str = ""
     INFISICAL_ADMIN_CLIENT_SECRET: str = ""
+    # Read-only Postgres URI for the Infisical DB. Powers the secret-
+    # change history poller — Infisical OSS doesn't expose audit_logs
+    # via API so we join secret_versions_v2 → secret_folders →
+    # project_environments → projects directly. Must be a limited role
+    # with SELECT on those 5 tables only — NEVER the superuser.
+    INFISICAL_DB_URI: str = ""
+    INFISICAL_HISTORY_POLL_SEC: int = 300
+    # Discord webhook for secret-change alerts (prod writes, non-operator
+    # identity writes). Reuses the general DISCORD_DB_ALERT_WEBHOOK_URL
+    # channel by default; override with a dedicated URL to route
+    # separately.
+    DISCORD_INFISICAL_ALERT_WEBHOOK_URL: str = ""
+    # Machine-identity name expected for automated operator writes. Any
+    # identity write NOT matching this name triggers a Discord alert.
+    INFISICAL_OPERATOR_IDENTITY_NAME: str = "kl"
 
     # Redis (cluster's redis-stack/redis-kl1-master). Pulse publishes spec.json and
     # job entries here for Jenkins to consume at bootstrap time.

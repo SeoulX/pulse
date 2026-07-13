@@ -14,6 +14,7 @@ import {
   FolderOpen,
   Rocket,
   Database,
+  KeyRound,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 
@@ -25,6 +26,7 @@ const navItems = [
   { href: "/dashboard/analytics", label: "AI Analytics", icon: Brain },
   { href: "/dashboard/deployments", label: "Deployments", icon: Rocket },
   { href: "/dashboard/databases", label: "Databases", icon: Database },
+  { href: "/dashboard/infisical", label: "Secrets", icon: KeyRound },
 ];
 
 const adminItems = [

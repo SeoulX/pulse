@@ -21,6 +21,7 @@ from api.handlers.export import router as export_router
 from api.handlers.health import router as health_router
 from api.handlers.deployments import router as deployments_router
 from api.handlers.databases import router as databases_router
+from api.handlers.infisical import router as infisical_router
 
 
 @asynccontextmanager
@@ -31,6 +32,12 @@ async def lifespan(app: FastAPI):
     import asyncio
     from services.db_sampler import run_sampler_loop
     sampler_task = asyncio.create_task(run_sampler_loop())
+
+    # Infisical secret-change history poller. Reads secret_versions_v2
+    # from the Infisical Postgres directly (OSS audit_logs is empty).
+    # First iteration backfills; subsequent are deltas.
+    from services import infisical_history
+    infisical_task = asyncio.create_task(infisical_history.poll_loop())
 
     # Kafka producer + optional stage-event consumer. Consumer is only
     # started when PULSE_STAGE_TRANSPORT ∈ {kafka, dual}; the http path
@@ -53,6 +60,11 @@ async def lifespan(app: FastAPI):
         sampler_task.cancel()
         try:
             await sampler_task
+        except (asyncio.CancelledError, Exception):
+            pass
+        infisical_task.cancel()
+        try:
+            await infisical_task
         except (asyncio.CancelledError, Exception):
             pass
         if kafka_started:
@@ -97,3 +109,4 @@ app.include_router(discover_router, prefix=prefix)
 app.include_router(export_router, prefix=prefix)
 app.include_router(deployments_router, prefix=prefix)
 app.include_router(databases_router, prefix=prefix)
+app.include_router(infisical_router, prefix=prefix)

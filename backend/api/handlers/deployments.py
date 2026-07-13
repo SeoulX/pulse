@@ -635,15 +635,18 @@ async def track_deployment_console(token: str, start: int = 0):
     if not dep:
         raise HTTPException(status_code=404, detail="Tracking link not found")
 
-    # Tag derivation matches _build_jenkins_spec's tag semantics: alpha
-    # for staging, plain for prod. Only single-env records supported here
-    # — multi-env deployments would need a query param to disambiguate.
+    # Prefer the actual dispatched tag persisted on the record — that's
+    # the truth for both form + manual_tag records. Fall back to args
+    # (legacy path) and finally the bootstrap tag for really old
+    # records that never captured a tag.
     env = dep.environments[0] if dep.environments else "staging"
-    tag = "v0.0.0-alpha" if env == "staging" else "v0.0.0"
-    # If args carries a specific tag (later builds after v0.0.0-alpha),
-    # prefer it. Falls back to bootstrap tag otherwise.
-    if isinstance(dep.args, dict) and dep.args.get("tag"):
+    bootstrap = "v0.0.0-alpha" if env == "staging" else "v0.0.0"
+    if getattr(dep, "tag", None):
+        tag = dep.tag
+    elif isinstance(dep.args, dict) and dep.args.get("tag"):
         tag = dep.args["tag"]
+    else:
+        tag = bootstrap
 
     build_number: Optional[int] = None
     if dep.latest_build_id:
@@ -1052,6 +1055,8 @@ async def _apply_add_worker(dep: DeploymentRequest) -> dict:
     existing = await list_tags(dep.repo_slug)
     new_tag = next_alpha_tag(existing)
     tag_res = await push_tag(dep.repo_slug, new_tag)
+    dep.tag = new_tag
+    await dep.save()
 
     return {
         "commit": commit_res.get("commit"),
@@ -1188,6 +1193,11 @@ async def approve_deployment(
                     f"(branch={from_branch or 'default'}): {result}",
                     flush=True,
                 )
+                # Persist the actual dispatched tag so the tracker + repo
+                # browser show the real name, not a bootstrap fallback.
+                # SEV: each record is single-env → last push_tag wins is
+                # a no-op (only one push_tag per dep in the SEV path).
+                dep.tag = name
 
         dep.status = "tags_pushed"
         await dep.save()

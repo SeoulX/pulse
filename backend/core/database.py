@@ -19,10 +19,11 @@ async def init_db():
     from models.deployment import DeploymentRequest
     from models.deployment_event import DeploymentEvent
     from models.db_metric_sample import DbMetricSample
+    from models.infisical_secret_event import InfisicalSecretEvent
 
     await init_beanie(
         database=db,
-        document_models=[User, Project, Endpoint, CheckResult, Notification, DeploymentRequest, DeploymentEvent, DbMetricSample],
+        document_models=[User, Project, Endpoint, CheckResult, Notification, DeploymentRequest, DeploymentEvent, DbMetricSample, InfisicalSecretEvent],
     )
 
 
