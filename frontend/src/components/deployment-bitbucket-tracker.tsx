@@ -670,6 +670,30 @@ export function DeploymentBitbucketTracker({
             → {data.manifestPath}
           </div>
         )}
+
+        {/* ArgoCD links per env — one row per env once the record has
+            an ArgoCD app registered. Shows regardless of status so
+            devs can jump to the Application even while a build is in
+            flight (useful for seeing sync + resource state). */}
+        {data.argocdLinks && Object.keys(data.argocdLinks).length > 0 && (
+          <div className="flex flex-col gap-1 rounded-md border bg-background/60 p-2 text-[11px]">
+            <span className="text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
+              ArgoCD
+            </span>
+            {Object.entries(data.argocdLinks).map(([env, url]) => (
+              <a
+                key={env}
+                href={url}
+                target="_blank"
+                rel="noreferrer"
+                className="inline-flex items-center gap-1.5 truncate text-[#e8871e] hover:underline dark:text-[#5ab4c5]"
+              >
+                <ExternalLink className="h-3 w-3 shrink-0" />
+                <span className="font-mono">{env}</span>
+              </a>
+            ))}
+          </div>
+        )}
       </aside>
 
       {/* ------------------------------------------------------------------ */}
