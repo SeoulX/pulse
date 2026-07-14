@@ -230,24 +230,35 @@ MANIFESTS_REPO = "manifests-seven-gen-v2"
 
 
 async def fetch_repo_file(repo_slug: str, path: str) -> str | None:
-    """Fetch a single file from the default branch of a Bitbucket repo.
-    Returns the file body on 200, None on 404 (file missing) or any error.
+    """Fetch a single file from a Bitbucket repo.
 
-    Used by the inspect endpoint to grab `devops/workers.yml` so the form
-    can validate the YAML and surface errors before the dev submits.
+    Tries the default branch first. Falls back to `staging` when the
+    default branch either doesn't have the file OR doesn't exist yet
+    (common when devs bootstrap a repo directly on the staging branch
+    and haven't merged to main/master yet — inspect_repo needs to see
+    devops/components.yml either way to unblock Pulse submission).
+    Returns the file body on 200, None on any final miss.
     """
     try:
         async with httpx.AsyncClient(auth=_auth(), timeout=15) as client:
             repo_resp = await _retry_request(client, "GET", _api(repo_slug))
             if repo_resp.status_code != 200:
                 return None
-            branch = (
+            default_branch = (
                 repo_resp.json().get("mainbranch", {}).get("name", "main")
             )
-            r = await _retry_request(
-                client, "GET", _api(f"{repo_slug}/src/{branch}/{path}")
-            )
-            return r.text if r.status_code == 200 else None
+            # Deduped, ordered: default first, then staging fallback.
+            branches: list[str] = []
+            for b in (default_branch, "staging"):
+                if b and b not in branches:
+                    branches.append(b)
+            for branch in branches:
+                r = await _retry_request(
+                    client, "GET", _api(f"{repo_slug}/src/{branch}/{path}")
+                )
+                if r.status_code == 200:
+                    return r.text
+            return None
     except Exception:
         return None
 _CLUSTERS_TO_SCAN = ("kl-1", "kl-2", "net3")
@@ -404,17 +415,30 @@ async def _detect_workload(
 
     Returns {} when no signal matches — UI keeps the form's default.
     """
+    # Fall through to `staging` when the file is missing on the default
+    # branch — devs commonly bootstrap on the staging branch first.
+    branches: list[str] = []
+    for b in (branch, "staging"):
+        if b and b not in branches:
+            branches.append(b)
+
     async def fetch(path: str) -> str | None:
-        r = await _retry_request(
-            client, "GET", _api(f"{repo_slug}/src/{branch}/{path}")
-        )
-        return r.text if r.status_code == 200 else None
+        for b in branches:
+            r = await _retry_request(
+                client, "GET", _api(f"{repo_slug}/src/{b}/{path}")
+            )
+            if r.status_code == 200:
+                return r.text
+        return None
 
     async def exists(path: str) -> bool:
-        r = await _retry_request(
-            client, "GET", _api(f"{repo_slug}/src/{branch}/{path}")
-        )
-        return r.status_code == 200
+        for b in branches:
+            r = await _retry_request(
+                client, "GET", _api(f"{repo_slug}/src/{b}/{path}")
+            )
+            if r.status_code == 200:
+                return True
+        return False
 
     (
         pkg, reqs, pyproject, workers_root, workers_devops, has_static_index,
@@ -640,11 +664,24 @@ async def inspect_repo(repo_slug: str) -> dict:
                     name, present = entry
                     result[f"has_{name}_branch"] = present
 
+            # Devs commonly bootstrap devops/ on the staging branch before
+            # merging to main/master. Check the default branch first and
+            # fall through to `staging` when it's absent — otherwise the
+            # form blocks submit with a spurious "components.yml missing"
+            # even though the file exists in the repo.
+            check_branches: list[str] = []
+            for b in (branch, "staging"):
+                if b and b not in check_branches:
+                    check_branches.append(b)
+
             async def check(key: str, path: str) -> tuple[str, bool]:
-                r = await _retry_request(
-                    client, "GET", _api(f"{repo_slug}/src/{branch}/{path}")
-                )
-                return key, r.status_code == 200
+                for b in check_branches:
+                    r = await _retry_request(
+                        client, "GET", _api(f"{repo_slug}/src/{b}/{path}")
+                    )
+                    if r.status_code == 200:
+                        return key, True
+                return key, False
 
             tasks: list = [check(k, p) for k, p in paths.items()]
             tasks.append(_manifests_existing_envs(client, repo_slug))
@@ -665,17 +702,27 @@ async def inspect_repo(repo_slug: str) -> dict:
                         # _manifests_existing_envs returns dict[cluster, list[env]]
                         result["existing_envs"] = entry
 
+            # Helper: fetch a file from the first branch that has it
+            # (default branch → staging fallback). Used by the summary
+            # blocks below so previews render even when devs bootstrap
+            # on staging before merging to main.
+            async def fetch_from_any_branch(path: str) -> httpx.Response | None:
+                for b in check_branches:
+                    r = await _retry_request(
+                        client, "GET", _api(f"{repo_slug}/src/{b}/{path}")
+                    )
+                    if r.status_code == 200:
+                        return r
+                return None
+
             # If devops/workers.yml exists, fetch + parse for a summary the
             # form can preview. Failures here are non-fatal — the form just
             # won't show the summary, but submit-time validation will still
             # surface the actual errors.
             if result.get("has_workers_yml"):
                 try:
-                    r = await _retry_request(
-                        client, "GET",
-                        _api(f"{repo_slug}/src/{branch}/devops/workers.yml"),
-                    )
-                    if r.status_code == 200:
+                    r = await fetch_from_any_branch("devops/workers.yml")
+                    if r is not None and r.status_code == 200:
                         # Lazy import — avoids a circular dep with schemas.
                         from schemas.workers import (
                             WorkersParseError,
@@ -711,11 +758,8 @@ async def inspect_repo(repo_slug: str) -> dict:
             # spec). Failures non-fatal — submit-time validation re-fetches.
             if result.get("has_components_yml"):
                 try:
-                    r = await _retry_request(
-                        client, "GET",
-                        _api(f"{repo_slug}/src/{branch}/devops/components.yml"),
-                    )
-                    if r.status_code == 200:
+                    r = await fetch_from_any_branch("devops/components.yml")
+                    if r is not None and r.status_code == 200:
                         from schemas.components import (
                             ComponentsParseError,
                             parse_components_yaml,

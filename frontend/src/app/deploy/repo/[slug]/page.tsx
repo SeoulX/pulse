@@ -65,6 +65,21 @@ const STATUS_STYLES: Record<string, string> = {
     "bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-400",
 };
 
+// Wall-clock time in Asia/Manila (PHT). Ops read logs by PHT even
+// when the browser is roaming.
+const TZ = "Asia/Manila";
+const _fmtDate = new Intl.DateTimeFormat("en-GB", {
+  timeZone: TZ,
+  year: "numeric",
+  month: "short",
+  day: "2-digit",
+  hour: "2-digit",
+  minute: "2-digit",
+  hour12: false,
+});
+function fmtAbs(iso: string): string {
+  return _fmtDate.format(new Date(iso)) + " PHT";
+}
 function fmtWhen(iso: string): string {
   const then = new Date(iso).getTime();
   const diff = Math.max(0, (Date.now() - then) / 1000);
@@ -306,8 +321,16 @@ export default function RepoBuildsPage() {
                           {b.origin === "manual_tag" ? "manual" : "form"}
                         </span>
                       </td>
-                      <td className="px-4 py-2 text-xs text-muted-foreground">
-                        {fmtWhen(b.createdAt)}
+                      <td
+                        className="px-4 py-2 text-xs text-muted-foreground"
+                        title={fmtAbs(b.createdAt)}
+                      >
+                        <div className="flex flex-col">
+                          <span>{fmtWhen(b.createdAt)}</span>
+                          <span className="text-[10px] opacity-70">
+                            {fmtAbs(b.createdAt)}
+                          </span>
+                        </div>
                       </td>
                       <td className="px-4 py-2 text-right">
                         {b.latestJenkinsBuildUrl && (

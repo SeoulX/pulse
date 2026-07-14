@@ -46,6 +46,22 @@ router = APIRouter(prefix="/deployments", tags=["deployments"])
 
 REGISTRY = "zen0hub"
 
+
+def _iso_utc(dt):
+    """Emit an ISO string with explicit +00:00 offset.
+
+    Beanie strips tzinfo on write for older records, so we can't rely
+    on the stored value carrying an offset. Assume Mongo UTC when
+    tzinfo is missing — matches the datetime.now(timezone.utc) writes
+    we use throughout. Prevents browsers from parsing bare ISO strings
+    as their local TZ (bug: PHT viewer saw values 8h behind reality).
+    """
+    if not dt:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.isoformat()
+
 _CLUSTER_TOLERATIONS = {
     "kl-1": [{"key": "proj", "operator": "Equal", "value": "salina", "effect": "NoSchedule"}],
     "kl-2": [{"key": "dept", "operator": "Equal", "value": "dc", "effect": "NoSchedule"}],
@@ -232,7 +248,7 @@ def serialize(d: DeploymentRequest) -> dict:
         "argocdLinks": _argocd_links(d.cluster, app, d.environments),
         "requestedBy": d.requested_by,
         "approvedBy": d.approved_by,
-        "approvedAt": d.approved_at.isoformat() if d.approved_at else None,
+        "approvedAt": _iso_utc(d.approved_at),
         "rejectionReason": d.rejection_reason,
         "trackToken": d.track_token,
         "trackUrl": f"/deploy/track/{d.track_token}",
@@ -240,7 +256,7 @@ def serialize(d: DeploymentRequest) -> dict:
         "workers": d.workers,
         "needsIngress": d.needs_ingress,
         "secretsEnabled": bool(d.secrets_enabled),
-        "createdAt": d.created_at.isoformat(),
+        "createdAt": _iso_utc(d.created_at),
     }
 
 
@@ -268,10 +284,10 @@ def serialize_public(d: DeploymentRequest) -> dict:
         "envErrors": d.env_errors or {},
         "argocdLinks": _argocd_links(d.cluster, app, d.environments),
         "rejectionReason": d.rejection_reason,
-        "approvedAt": d.approved_at.isoformat() if d.approved_at else None,
+        "approvedAt": _iso_utc(d.approved_at),
         "trackToken": d.track_token,
         "submissionId": d.submission_id,
-        "createdAt": d.created_at.isoformat(),
+        "createdAt": _iso_utc(d.created_at),
         "attempt": int(d.attempt or 1),
         "latestBuildId": d.latest_build_id,
         "latestLogExcerpt": d.latest_log_excerpt,
@@ -395,11 +411,7 @@ async def list_repos(limit: int = 50):
             "latestEnv": d.get("latest_env"),
             "latestTag": d.get("latest_tag"),
             "latestCluster": d.get("latest_cluster"),
-            "latestCreatedAt": (
-                d["latest_created_at"].isoformat()
-                if d.get("latest_created_at")
-                else None
-            ),
+            "latestCreatedAt": _iso_utc(d.get("latest_created_at")),
             "latestTrackToken": d.get("latest_track_token"),
             "total": d.get("total", 0),
         }
@@ -602,7 +614,7 @@ async def track_deployment_events(token: str):
             "state": e.state,
             "buildId": e.build_id,
             "jobId": e.job_id,
-            "ts": e.ts.isoformat(),
+            "ts": _iso_utc(e.ts),
             "error": e.error,
             "logExcerpt": e.log_excerpt,
             "jenkinsBuildUrl": e.jenkins_build_url,

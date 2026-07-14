@@ -32,6 +32,19 @@ const STATUS_STYLES: Record<string, string> = {
     "bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-400",
 };
 
+const _fmtDate = new Intl.DateTimeFormat("en-GB", {
+  timeZone: "Asia/Manila",
+  year: "numeric",
+  month: "short",
+  day: "2-digit",
+  hour: "2-digit",
+  minute: "2-digit",
+  hour12: false,
+});
+function fmtAbs(iso: string | null): string {
+  if (!iso) return "";
+  return _fmtDate.format(new Date(iso)) + " PHT";
+}
 function fmtWhen(iso: string | null): string {
   if (!iso) return "";
   const then = new Date(iso).getTime();
@@ -125,8 +138,16 @@ export function DeploymentRepoBrowser() {
                 <span className="rounded-md border px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground">
                   {r.latestCluster}
                 </span>
-                <span className="ml-auto text-[10px] text-muted-foreground">
+                <span
+                  className="ml-auto text-[10px] text-muted-foreground"
+                  title={fmtAbs(r.latestCreatedAt)}
+                >
                   {r.total} build{r.total === 1 ? "" : "s"} · {fmtWhen(r.latestCreatedAt)}
+                  {r.latestCreatedAt && (
+                    <span className="ml-1 opacity-70">
+                      ({fmtAbs(r.latestCreatedAt)})
+                    </span>
+                  )}
                 </span>
                 <ArrowRight className="h-3.5 w-3.5 text-muted-foreground opacity-0 transition-opacity group-hover:opacity-100" />
               </Link>
