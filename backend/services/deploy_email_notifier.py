@@ -34,6 +34,46 @@ def is_configured() -> bool:
     return bool(settings.SMTP_HOST and settings.SMTP_USER and settings.SMTP_PASS)
 
 
+_ORG_DOMAIN = "seven-gen.com"
+
+
+def _is_org(email: str | None) -> bool:
+    return bool(email and "@" in email and email.split("@", 1)[1].lower() == _ORG_DOMAIN)
+
+
+async def _resolve_recipient(dep: DeploymentRequest) -> str | None:
+    """Pick the email to send to.
+
+    Rules:
+      1. If the current record's requested_by is @seven-gen.com, use it
+         (covers both form submitter and Bitbucket tag author when the
+         tag was cut by an org member).
+      2. Otherwise fall back to the ORIGINAL form-submitter for the
+         same (slug, env). Handles the case where a non-org author
+         (e.g. a personal gmail on a contract) pushed a follow-up tag
+         to a repo the org originally onboarded through Pulse — we
+         still want the person who owns the deploy to hear about it.
+      3. If neither yields an @seven-gen.com address, return None
+         (caller skips send).
+    """
+    if _is_org(dep.requested_by):
+        return dep.requested_by
+
+    env = dep.environments[0] if dep.environments else None
+    if not env:
+        return None
+
+    query = [
+        DeploymentRequest.repo_slug == dep.repo_slug,
+        {"environments": env},
+        {"origin": "form"},
+    ]
+    original = await DeploymentRequest.find(*query).sort("+createdAt").limit(1).to_list()
+    if original and _is_org(original[0].requested_by):
+        return original[0].requested_by
+    return None
+
+
 def _tracker_url(dep: DeploymentRequest) -> str:
     """Build the tracker URL for the deploy record so the email links
     straight into the browser view devs already know."""
@@ -43,7 +83,8 @@ def _tracker_url(dep: DeploymentRequest) -> str:
 
 def _build_email(dep: DeploymentRequest, status: str,
                  log_excerpt: str | None,
-                 jenkins_console_url: str | None) -> MIMEMultipart:
+                 jenkins_console_url: str | None,
+                 recipient: str) -> MIMEMultipart:
     is_success = status in _SUCCESS_STATUSES
     env = dep.environments[0] if dep.environments else "?"
     tag = getattr(dep, "tag", None) or "?"
@@ -102,7 +143,7 @@ def _build_email(dep: DeploymentRequest, status: str,
     msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
     msg["From"]    = settings.SMTP_FROM
-    msg["To"]      = dep.requested_by
+    msg["To"]      = recipient
     msg.attach(MIMEText("\n".join(plain), "plain"))
     msg.attach(MIMEText(html, "html"))
     return msg
@@ -120,17 +161,19 @@ async def notify_deploy_result(
         return
     if status not in _TERMINAL_STATUSES:
         return
-    if not dep.requested_by or "@" not in dep.requested_by:
-        log.info("deploy email skipped — requested_by missing/invalid: %r",
-                 dep.requested_by)
-        return
-    # Skip only the sentinel fallback for manual_tag records w/ no
-    # resolvable Bitbucket author — nothing meaningful to send.
-    if dep.requested_by == "jenkins@ci":
+    # Restrict outbound to @seven-gen.com. If the current record's
+    # requested_by isn't org, fall back to the original form-submitter
+    # for the same (slug, env). If neither, skip.
+    recipient = await _resolve_recipient(dep)
+    if not recipient:
+        log.info(
+            "deploy email skipped — no @%s recipient (record requested_by=%r)",
+            _ORG_DOMAIN, dep.requested_by,
+        )
         return
 
     try:
-        msg = _build_email(dep, status, log_excerpt, jenkins_console_url)
+        msg = _build_email(dep, status, log_excerpt, jenkins_console_url, recipient)
         await aiosmtplib.send(
             msg,
             hostname=settings.SMTP_HOST,
@@ -141,9 +184,9 @@ async def notify_deploy_result(
             timeout=15,
         )
         log.info(
-            "deploy email sent to %s (repo=%s tag=%s status=%s)",
-            dep.requested_by, dep.repo_slug,
-            getattr(dep, "tag", "?"), status,
+            "deploy email sent to %s (repo=%s tag=%s status=%s, dep.requested_by=%s)",
+            recipient, dep.repo_slug,
+            getattr(dep, "tag", "?"), status, dep.requested_by,
         )
     except Exception:
         log.exception("deploy email dispatch failed")
