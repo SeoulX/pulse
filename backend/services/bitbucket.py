@@ -819,6 +819,40 @@ async def list_tags(repo_slug: str) -> list[str]:
         return []
 
 
+async def get_tag_author_email(repo_slug: str, tag_name: str) -> Optional[str]:
+    """Resolve a tag → its target commit → author email.
+
+    Used by the orphan-tag branch of pipeline_callback so a manual
+    `git push origin vX.Y.Z` attributes the deploy to the human who
+    cut the tag, not to `jenkins@ci`. Bitbucket's `author.raw` field
+    is `Name <email@host>`; we strip the angle-bracketed email.
+
+    Returns None on any error — caller falls back to a sentinel.
+    """
+    try:
+        async with httpx.AsyncClient(auth=_auth(), timeout=15) as client:
+            r = await _retry_request(
+                client, "GET", _api(f"{repo_slug}/refs/tags/{tag_name}")
+            )
+            if r.status_code != 200:
+                return None
+            tag_target = (r.json().get("target") or {}).get("hash")
+            if not tag_target:
+                return None
+            r = await _retry_request(
+                client, "GET",
+                _api(f"{repo_slug}/commit/{tag_target}?fields=author"),
+            )
+            if r.status_code != 200:
+                return None
+            raw = ((r.json().get("author") or {}).get("raw") or "")
+            # Format: "Full Name <email@host>". Grab the angle brackets.
+            m = re.search(r"<([^>]+@[^>]+)>", raw)
+            return m.group(1).strip().lower() if m else None
+    except Exception:
+        return None
+
+
 async def list_tags_detailed(repo_slug: str) -> list[dict]:
     """Same as list_tags but keeps each tag's target commit date + hash.
 

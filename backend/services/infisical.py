@@ -185,6 +185,34 @@ async def ensure_folder(project_id: str, env_slug: str, path: str) -> bool:
         return True
 
 
+async def ensure_human_members(project_id: str, emails: Iterable[str]) -> None:
+    """Add human accounts to a project.
+
+    Projects created by the machine identity have zero human members by
+    default — invisible in the UI until someone is added. This runs at
+    the tail of bootstrap_scope so every form-submitted project is
+    reachable by DevOps admins without a manual click.
+
+    Idempotent: 400/409 from Infisical (already a member) treated as OK.
+    """
+    email_list = [e for e in emails if e]
+    if not email_list:
+        return
+    async with await _client() as c:
+        token = await _login(c)
+        h = {"Authorization": f"Bearer {token}"}
+        r = await c.post(
+            f"/v2/workspace/{project_id}/memberships",
+            headers=h,
+            json={"emails": email_list},
+        )
+        if r.status_code >= 400 and r.status_code not in (400, 409):
+            log.warning(
+                "infisical ensure_human_members %s emails=%s -> HTTP %d body=%s",
+                project_id, email_list, r.status_code, r.text[:400],
+            )
+
+
 async def bootstrap_scope(
     *,
     project_slug: str,
@@ -192,8 +220,9 @@ async def bootstrap_scope(
     envs: Iterable[str],
     paths: Iterable[str],
 ) -> Optional[str]:
-    """Ensure project + all (env × path) combinations. Returns the
-    project ID on success or None when even the project step failed."""
+    """Ensure project + all (env × path) combinations + attach the
+    project to configured human admins. Returns the project ID on
+    success or None when the project step failed."""
     if not is_configured():
         log.info("infisical bootstrap skipped — creds not configured")
         return None
@@ -209,4 +238,13 @@ async def bootstrap_scope(
         await ensure_environment(pid, env)
         for path in path_list:
             await ensure_folder(pid, env, path)
+    # Auto-attach human admins so freshly-created projects show up in
+    # the UI without manual member-add. Comma-separated in the env.
+    default_members = [
+        e.strip()
+        for e in getattr(settings, "INFISICAL_AUTO_INVITE_EMAILS", "").split(",")
+        if e.strip()
+    ]
+    if default_members:
+        await ensure_human_members(pid, default_members)
     return pid

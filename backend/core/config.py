@@ -23,6 +23,10 @@ class Settings(BaseSettings):
     SMTP_USER: str = ""
     SMTP_PASS: str = ""
     SMTP_FROM: str = "Pulse <noreply@pulse.dev>"
+    # Public URL of the Pulse frontend, used to build tracker links in
+    # outbound emails. Local dev keeps localhost:3000; staging + prod
+    # deployments override via env.
+    PULSE_PUBLIC_URL: str = "http://localhost:3000"
 
     DISCORD_WEBHOOK_URL: str = ""
 
@@ -77,6 +81,11 @@ class Settings(BaseSettings):
     INFISICAL_HOST_API: str = "https://infisical-kl.media-meter.in/api"
     INFISICAL_ADMIN_CLIENT_ID: str = ""
     INFISICAL_ADMIN_CLIENT_SECRET: str = ""
+    # Comma-separated human emails auto-added as project members after
+    # every bootstrap. Machine-identity-created projects have zero
+    # human members otherwise → invisible in the UI. Default routes
+    # admin access to DevOps.
+    INFISICAL_AUTO_INVITE_EMAILS: str = "devops@seven-gen.com"
     # Read-only Postgres URI for the Infisical DB. Powers the secret-
     # change history poller — Infisical OSS doesn't expose audit_logs
     # via API so we join secret_versions_v2 → secret_folders →

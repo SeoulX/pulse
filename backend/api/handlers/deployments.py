@@ -25,6 +25,7 @@ from services.bitbucket import (
     create_branch,
     delete_tag,
     fetch_repo_file,
+    get_tag_author_email,
     inspect_repo,
     list_tags,
     list_tags_detailed,
@@ -1544,6 +1545,12 @@ async def pipeline_callback(repo_slug: str, body: PipelineCallback):
         # populated (older Jenkinsfiles without `tag` in the callback body
         # keep the legacy "no match" no-op).
         if body.env and body.tag:
+            # Resolve the tag → commit → author on Bitbucket so the
+            # orphan record attributes the deploy to the human who
+            # cut the tag (matches the "form submitter" semantics
+            # for form-flow records). Falls back to `jenkins@ci`
+            # when Bitbucket is unreachable or the author is missing.
+            author = await get_tag_author_email(repo_slug, body.tag)
             dep = DeploymentRequest(
                 repo_slug=repo_slug,
                 repo_url=f"https://bitbucket.org/{settings.BITBUCKET_WORKSPACE}/{repo_slug}.git",
@@ -1554,7 +1561,7 @@ async def pipeline_callback(repo_slug: str, body: PipelineCallback):
                 environments=[body.env],
                 env_vars={},
                 domain_zone="media-meter.in",
-                requested_by="jenkins@ci",
+                requested_by=author or "jenkins@ci",
                 status=body.status,
                 origin="manual_tag",
                 tag=body.tag,
@@ -1621,6 +1628,21 @@ async def pipeline_callback(repo_slug: str, body: PipelineCallback):
         dep.latest_jenkins_console_url = body.jenkins_console_url
 
     await dep.save()
+
+    # Terminal-status email to the dev who submitted. Best-effort — SMTP
+    # outage never bubbles into the callback response so a lost email
+    # can't 500 the deploy pipeline.
+    if body.status in ("completed", "failed", "failed_build", "failed_manifest"):
+        try:
+            from services import deploy_email_notifier
+            await deploy_email_notifier.notify_deploy_result(
+                dep,
+                status=body.status,
+                log_excerpt=body.log_excerpt or dep.latest_log_excerpt,
+                jenkins_console_url=body.jenkins_console_url or dep.latest_jenkins_console_url,
+            )
+        except Exception:
+            traceback.print_exc()
 
     # Persist the stage transition + fan out on Kafka. Direct write (not
     # via the consumer) because we already have the DeploymentRequest in
