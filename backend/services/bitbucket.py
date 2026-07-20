@@ -905,15 +905,51 @@ def next_alpha_tag(existing: list[str]) -> str:
     return f"v{best[0]}.{best[1]}.{best[2] + 1}-alpha"
 
 
+def next_prod_tag(existing: list[str]) -> str:
+    """Pick the next `vX.Y.Z` production tag. Symmetric to
+    `next_alpha_tag`. Bumps patch. Falls back to `v0.0.1` — v0.0.0 is
+    reserved for the bootstrap sentinel."""
+    best: tuple[int, int, int] | None = None
+    for t in existing:
+        m = re.match(r"^v(\d+)\.(\d+)\.(\d+)$", t)
+        if not m:
+            continue
+        triple = (int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        if best is None or triple > best:
+            best = triple
+    if best is None:
+        return "v0.0.1"
+    return f"v{best[0]}.{best[1]}.{best[2] + 1}"
+
+
+_ALPHA_TAG_RE   = re.compile(r"^v(\d+)\.(\d+)\.(\d+)-alpha$")
+_PROD_TAG_RE    = re.compile(r"^v(\d+)\.(\d+)\.(\d+)$")
+
+
 def classify_tags(existing: list[str]) -> dict:
-    """Split tag list into bootstrap (ours) and release (real vX.Y.Z) categories."""
+    """Split tag list into three buckets:
+
+    - `bootstrap` — the exact bootstrap sentinels (`v0.0.0-alpha`, `v0.0.0`)
+    - `alpha`     — all `vX.Y.Z-alpha` staging tags EXCEPT the bootstrap
+    - `release`   — all `vX.Y.Z` production tags EXCEPT the bootstrap
+
+    Previous single "release" bucket lumped alphas in with real releases
+    because the regex accepted any suffix. Callers using `release` to
+    decide "have we shipped production?" got a false positive as soon
+    as the first staging bump landed.
+    """
     existing_set = set(existing)
     bootstrap_present = sorted(t for t in BOOTSTRAP_TAGS if t in existing_set)
+    alpha_present = sorted(
+        t for t in existing
+        if t not in BOOTSTRAP_TAGS and _ALPHA_TAG_RE.match(t)
+    )
     release_present = sorted(
         t for t in existing
-        if t not in BOOTSTRAP_TAGS and _RELEASE_TAG_RE.match(t)
+        if t not in BOOTSTRAP_TAGS and _PROD_TAG_RE.match(t)
     )
     return {
         "bootstrap": bootstrap_present,
-        "release": release_present,
+        "alpha":     alpha_present,
+        "release":   release_present,
     }

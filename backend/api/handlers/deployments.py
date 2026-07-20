@@ -29,6 +29,7 @@ from services.bitbucket import (
     list_tags,
     list_tags_detailed,
     next_alpha_tag,
+    next_prod_tag,
     parse_repo_slug,
     push_tag,
 )
@@ -73,9 +74,11 @@ _CLUSTER_TOLERATIONS = {
 # only reachable on the cluster LAN via NodePort. UI links are computed here
 # so a central change doesn't require touching every frontend that renders them.
 _ARGOCD_BASE = {
-    "kl-1": "https://argocd-kl.media-meter.in",
+    # Public DNS retired — kl-1/net3 ArgoCD now only reachable via VPN
+    # NodePort. Same style as kl-2 (direct node IP + nodeport, http).
+    "kl-1": "http://192.168.11.40:30443",
     "kl-2": "http://192.168.12.16:30443",
-    "net3": "https://192.168.3.28:30247",
+    "net3": "http://192.168.3.28:30247",
 }
 
 
@@ -264,6 +267,10 @@ def serialize_public(d: DeploymentRequest) -> dict:
     """Public-safe view. No requester email, no _id."""
     app = d.repo_slug.replace("_", "-")
     return {
+        # Deployment ObjectId — required by the tracker's Retry button
+        # to hit POST /api/deployments/{id}/retry. Safe to expose:
+        # /retry itself is admin-gated so a leaked id can't be abused.
+        "deploymentId": str(d.id),
         "repoSlug": d.repo_slug,
         "team": d.team,
         "workloadKind": d.workload_kind,
@@ -311,28 +318,60 @@ def _bootstrap_tag_for(d: DeploymentRequest) -> Optional[str]:
 
 
 async def _build_planned(dep: DeploymentRequest) -> dict:
-    """Compute the Jenkins dispatch plan (tag actions, webhook, etc.)."""
+    """Compute the Jenkins dispatch plan (tag actions, webhook, etc.).
+
+    Bootstrap vs. resubmit strategy (fixes B4):
+    - First deploy for a repo/env → cut the bootstrap tag
+      (v0.0.0-alpha for staging, v0.0.0 for production). Only fires
+      when the bootstrap tag doesn't yet exist on Bitbucket.
+    - Repeat deploy (bootstrap already exists) → cut the next
+      versioned tag via `next_alpha_tag()` / `next_prod_tag()`. Non-
+      destructive: preserves old builds, gives Jenkins a fresh tag
+      to scan, avoids build-number collisions.
+    """
     existing_tags = await list_tags(dep.repo_slug)
     tag_class = classify_tags(existing_tags)
+    bootstrap_present = set(tag_class["bootstrap"])
 
-    env_tag_map = {"staging": "v0.0.0-alpha", "production": "v0.0.0"}
+    env_bootstrap_map = {"staging": "v0.0.0-alpha", "production": "v0.0.0"}
     # Per-env branch source — staging tag cuts from `staging` branch,
     # production cuts from the default branch (main or master). Pulse
     # auto-creates the staging branch from default during dispatch when
     # missing (see approve flow).
     env_branch_map = {"staging": "staging", "production": None}  # None = default branch
-    planned_tag_names = [env_tag_map[e] for e in dep.environments]
-    conflicted = set(tag_class["bootstrap"]) & set(planned_tag_names)
 
     tag_actions: list[dict] = []
+    conflicted: list[str] = []
     for env in dep.environments:
-        tag = env_tag_map[env]
+        bootstrap_tag = env_bootstrap_map[env]
         from_branch = env_branch_map[env]
-        if tag in conflicted:
-            tag_actions.append(
-                {"action": "delete_tag", "name": tag, "reason": "bootstrap tag already exists"}
-            )
-        tag_actions.append({"action": "push_tag", "name": tag, "from_branch": from_branch, "env": env})
+
+        if bootstrap_tag not in bootstrap_present:
+            # First deploy for this env → cut the bootstrap sentinel.
+            tag_actions.append({
+                "action":      "push_tag",
+                "name":        bootstrap_tag,
+                "from_branch": from_branch,
+                "env":         env,
+                "reason":      "bootstrap (first deploy for this env)",
+            })
+        else:
+            # Bootstrap already present — cut the next versioned tag
+            # instead of destructively re-cutting the bootstrap. This
+            # avoids Jenkins build-number collisions and preserves
+            # historical builds visible in the repo browser.
+            if env == "staging":
+                next_tag = next_alpha_tag(existing_tags)
+            else:
+                next_tag = next_prod_tag(existing_tags)
+            conflicted.append(bootstrap_tag)
+            tag_actions.append({
+                "action":      "push_tag",
+                "name":        next_tag,
+                "from_branch": from_branch,
+                "env":         env,
+                "reason":      "bump (bootstrap already exists)",
+            })
 
     return {
         "repo_slug": dep.repo_slug,
@@ -349,7 +388,10 @@ async def _build_planned(dep: DeploymentRequest) -> dict:
         "hpa": dep.hpa,
         "manifest_path": _manifest_path(dep),
         "existing_tags": existing_tags,
-        "conflict_strategy": "delete_and_repush" if conflicted else None,
+        # Legacy field kept for compat with old admin dashboards. Value
+        # now means "we bumped instead of re-cutting", never
+        # `delete_and_repush` (destructive path removed).
+        "conflict_strategy": "bump_next_version" if conflicted else None,
         "webhook": {"action": "add_webhook", "url": "<JENKINS_WEBHOOK_URL>"},
         "tags": tag_actions,
         "requested_by": dep.requested_by,
@@ -707,12 +749,31 @@ async def inspect_repo_handler(repo_slug: str):
 # Statuses that don't yet have a finalized spec or are no longer dispatchable.
 # Jenkins should never bootstrap from these — return 404.
 _NO_SPEC_STATUSES = {"pending_approval", "rejected"}
+# Regex-based env classification so bumped tags (v0.0.4-alpha, v0.1.3)
+# resolve as well as bootstrap. Prior version had a hardcoded map that
+# only matched v0.0.0-alpha / v0.0.0 — any resubmission fell through
+# to "most recent by createdAt" and Jenkins manual re-runs picked up
+# the wrong spec (wrong cluster, wrong components.yml).
+_TAG_ALPHA_RE = re.compile(r"^v\d+\.\d+\.\d+-(alpha|beta|rc[.-]?\d*)$")
+_TAG_PROD_RE  = re.compile(r"^v\d+\.\d+\.\d+$")
+
+
+def _env_for_tag(tag: str | None) -> str | None:
+    if not tag:
+        return None
+    if _TAG_ALPHA_RE.match(tag):
+        return "staging"
+    if _TAG_PROD_RE.match(tag):
+        return "production"
+    return None
 
 # Maps the bootstrap tag Jenkins is building to the env that requested it.
 # Used to scope /spec lookups so re-running an old tag picks up the spec from
 # the deployment that originally requested that env, not just whatever was
 # submitted most recently.
-_TAG_ENV_MAP = {"v0.0.0-alpha": "staging", "v0.0.0": "production"}
+# Legacy — kept as an alias so any external caller or older internal
+# reference still resolves. New code uses `_env_for_tag()`.
+_TAG_ENV_MAP = {"v0.0.0-alpha": "staging", "v0.0.0": "production"}  # noqa: F841
 
 
 @router.get("/spec/{repo_slug}")
@@ -744,16 +805,40 @@ async def get_jenkins_spec(repo_slug: str, request: Request, tag: str | None = N
     if auth_header != f"Bearer {settings.JENKINS_SHARED_SECRET}":
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-    query = [
-        DeploymentRequest.repo_slug == repo_slug,
-        {"status": {"$nin": list(_NO_SPEC_STATUSES)}},
-    ]
-    if tag in _TAG_ENV_MAP:
-        query.append({"environments": _TAG_ENV_MAP[tag]})
-
-    dep = await DeploymentRequest.find_one(*query, sort=[("createdAt", -1)])
+    # Lookup priority so a manual Jenkins re-run picks up the SAME
+    # spec that fired the original build:
+    #   1. Exact match on dep.tag (fixes the "manual rerun defaulted to
+    #      kl-1 instead of kl-2" bug — the record that pushed this tag
+    #      already knows the right cluster + components spec).
+    #   2. Env fallback: newest approved deployment for the derived env.
+    #      Handles bootstrap tags on first-time deploys where no record
+    #      has dep.tag persisted yet.
+    #   3. Slug fallback: newest approved deployment for the repo,
+    #      any env. Last-resort when neither of the above match.
+    env = _env_for_tag(tag)
+    dep: DeploymentRequest | None = None
+    if tag:
+        dep = await DeploymentRequest.find_one(
+            DeploymentRequest.repo_slug == repo_slug,
+            DeploymentRequest.tag == tag,
+            {"status": {"$nin": list(_NO_SPEC_STATUSES)}},
+            sort=[("createdAt", -1)],
+        )
+    if dep is None and env:
+        dep = await DeploymentRequest.find_one(
+            DeploymentRequest.repo_slug == repo_slug,
+            {"environments": env},
+            {"status": {"$nin": list(_NO_SPEC_STATUSES)}},
+            sort=[("createdAt", -1)],
+        )
+    if dep is None:
+        dep = await DeploymentRequest.find_one(
+            DeploymentRequest.repo_slug == repo_slug,
+            {"status": {"$nin": list(_NO_SPEC_STATUSES)}},
+            sort=[("createdAt", -1)],
+        )
     if not dep:
-        scope = f" (tag={tag}, env={_TAG_ENV_MAP[tag]})" if tag in _TAG_ENV_MAP else ""
+        scope = f" (tag={tag}, env={env})" if tag else ""
         raise HTTPException(
             status_code=404,
             detail=f"No approved deployment found for {repo_slug}{scope}",
@@ -763,8 +848,8 @@ async def get_jenkins_spec(repo_slug: str, request: Request, tag: str | None = N
     # tag is bootstrapping. Otherwise parallel staging/prod builds would each
     # generate both env subtrees from the spec, race on git push, and only
     # one commit message would land.
-    if tag in _TAG_ENV_MAP:
-        spec["environments"] = [_TAG_ENV_MAP[tag]]
+    if env:
+        spec["environments"] = [env]
     return spec
 
 
@@ -867,6 +952,28 @@ async def create_deployment(body: CreateDeploymentRequest):
             for comp in parsed_components:
                 if comp.get("needs_ingress"):
                     comp["needs_ingress"] = False
+
+    # B3: mark any existing non-terminal same-(slug, env) records as
+    # superseded so the callback path doesn't attach a new build's
+    # status to a stale record and leave two "in-flight" entries in the
+    # tracker. Terminal statuses (completed / failed_* / rejected)
+    # already survive resubmission — a fresh submission is a fresh
+    # attempt, not a status flip on the old record.
+    for env in body.environments:
+        stale = await DeploymentRequest.find(
+            DeploymentRequest.repo_slug == slug,
+            {"environments": env},
+            {"status": {"$nin": list(_PER_ENV_TERMINAL)}},
+        ).to_list()
+        for old in stale:
+            old.status = "superseded"
+            old.error = "Replaced by a newer submission"
+            await old.save()
+            print(
+                f"[DEPLOYMENT SUPERSEDED] {slug}/{env} old-token="
+                f"{old.track_token} → superseded",
+                flush=True,
+            )
 
     submission_id = uuid.uuid4().hex
     created: list[DeploymentRequest] = []
@@ -1184,10 +1291,17 @@ async def approve_deployment(
 
         for action in planned["tags"]:
             name = action["name"]
+            # Legacy `delete_tag` action is no longer emitted by
+            # _build_planned (B4 fix). Kept as a no-op branch so a
+            # stale in-memory plan from an older worker won't crash.
             if action["action"] == "delete_tag":
-                result = await delete_tag(dep.repo_slug, name)
-                print(f"[DEPLOYMENT DISPATCH] {dep.repo_slug} delete {name}: {result}", flush=True)
-            elif action["action"] == "push_tag":
+                print(
+                    f"[DEPLOYMENT DISPATCH] {dep.repo_slug} SKIP delete_tag {name} "
+                    "(legacy action; bump-next-version supersedes)",
+                    flush=True,
+                )
+                continue
+            if action["action"] == "push_tag":
                 from_branch = action.get("from_branch")  # None → default branch
                 # Auto-create staging branch from default if missing —
                 # devs at this org keep `staging` + `main`/`master`,
@@ -1324,7 +1438,11 @@ async def reject_deployment(
 # further callbacks for that env are ignored. The success-terminal "completed"
 # is per-env too, so a completed prod no longer swallows a failed staging.
 _FAILURE_STATUSES = {"failed", "failed_build", "failed_manifest", "rejected"}
-_PER_ENV_TERMINAL = _FAILURE_STATUSES | {"completed"}
+# `superseded` marks a record replaced by a newer submission for the same
+# (slug, env). Terminal so the callback path and later resubmits both
+# skip it — otherwise a stale non-terminal record would keep catching
+# callbacks meant for the fresh submission.
+_PER_ENV_TERMINAL = _FAILURE_STATUSES | {"completed", "superseded"}
 
 # Phase ordering for the worst-of aggregate. Failures rank highest so any env
 # failure surfaces on the aggregate pill. completed ranks lowest among terminals
@@ -1669,8 +1787,19 @@ async def handle_kafka_event(payload: dict) -> None:
 @router.post("/{deployment_id}/retry")
 async def retry_deployment(
     deployment_id: str,
+    rebase: bool = False,
     admin: User = Depends(require_admin),
 ):
+    """Retry a failed deployment.
+
+    Default: republishes the spec + re-enqueues Jenkins against the SAME
+    tag. Use for transient failures (kaniko OOM, docker registry hiccup).
+
+    `?rebase=true`: also deletes the old tag and re-cuts it against the
+    current branch HEAD. Use when the dev pushed a fix to `staging` /
+    `main` between attempts and wants the retry to build the fresh
+    commit. Skipped for orphan_tag / add_worker records.
+    """
     dep = await DeploymentRequest.get(deployment_id)
     if not dep:
         raise HTTPException(status_code=404, detail="Deployment not found")
@@ -1691,6 +1820,37 @@ async def retry_deployment(
     dep.latest_jenkins_console_url = None
     dep.latest_build_id = None
 
+    # B7: bump sibling records that share this submission_id so the
+    # tracker page renders one consistent attempt number across envs.
+    if dep.submission_id:
+        siblings = await DeploymentRequest.find(
+            DeploymentRequest.submission_id == dep.submission_id,
+            DeploymentRequest.id != dep.id,
+        ).to_list()
+        for sib in siblings:
+            sib.attempt = int(sib.attempt or 1) + 1
+            await sib.save()
+
+    # B2: optional rebase — re-cut the current tag against branch HEAD
+    # so a code fix pushed between attempts actually gets built.
+    # Skipped when we don't have a real tag on the record
+    # (manual_tag / orphan records).
+    if rebase and getattr(dep, "tag", None) and getattr(dep, "origin", "form") == "form":
+        env_for_tag = dep.environments[0] if dep.environments else "staging"
+        env_branch_map = {"staging": "staging", "production": None}
+        from_branch = env_branch_map.get(env_for_tag)
+        try:
+            await delete_tag(dep.repo_slug, dep.tag)
+            await push_tag(dep.repo_slug, dep.tag, from_branch=from_branch)
+            print(
+                f"[RETRY REBASE] {dep.repo_slug} tag={dep.tag} "
+                f"branch={from_branch or 'default'} recut",
+                flush=True,
+            )
+        except Exception as exc:
+            traceback.print_exc()
+            print(f"[RETRY REBASE] {dep.repo_slug} rebase failed: {exc}", flush=True)
+
     # Re-publish spec (in case it was pruned) and enqueue on both queues.
     try:
         spec = _build_jenkins_spec(dep)
@@ -1705,10 +1865,12 @@ async def retry_deployment(
             requested_by=admin.email if hasattr(admin, "email") else str(admin),
         )
         env_for_job = dep.environments[0] if dep.environments else "staging"
+        # B1: prefer the persisted dep.tag over the args-tag fallback so
+        # the Kafka job reports the real dispatched tag, not v0.0.0.
         tag_for_job = (
-            f"{dep.args.get('tag', 'v0.0.0')}"
-            if isinstance(dep.args, dict)
-            else "v0.0.0"
+            getattr(dep, "tag", None)
+            or (dep.args.get("tag") if isinstance(dep.args, dict) else None)
+            or ("v0.0.0-alpha" if env_for_job == "staging" else "v0.0.0")
         )
         kafka_job_id = await kafka_events.enqueue_job(
             track_token=dep.track_token,
@@ -1733,4 +1895,5 @@ async def retry_deployment(
         "attempt": dep.attempt,
         "latestJobId": dep.latest_job_id,
         "trackToken": dep.track_token,
+        "rebased": bool(rebase and getattr(dep, "tag", None)),
     }

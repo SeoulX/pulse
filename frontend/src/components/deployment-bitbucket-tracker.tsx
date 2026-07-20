@@ -198,6 +198,12 @@ interface LogRow {
 }
 
 const ANSI_RE = /\x1b\[[0-9;?]*[A-Za-z]/g;
+// Signatures for the row body that actually contains the failure
+// output — kaniko/curl errors, HTTP 4xx/5xx unauthorized, ENOENT,
+// stack traces. Used to pin the pinkish-red X to the meaningful
+// row instead of always the last one.
+const ERROR_LINE_RE =
+  /(?:^error\b|^ERROR\b|error checking push permissions|unexpected status code|Unauthorized|Traceback|exit code [1-9]|not found|denied: |ENOENT|Killed|OOMKilled)/im;
 // Jenkins progressiveText prefixes every `[Pipeline]` marker with a
 // base64-ish hyperlink blob (`IAAAA=` etc.) and follows it with a
 // `ha:////...=` continuation line. Match unanchored + drop the noise.
@@ -238,6 +244,22 @@ function splitLogIntoRows(text: string): LogRow[] {
     if (/\[Pipeline\] (\}|\/\/|End of Pipeline|node|Start of Pipeline)/.test(line)) {
       continue;
     }
+    // Jenkins credentials-binding chatter that shows up in every masked
+    // stage. Adds noise, never useful to devs — filter out.
+    if (/^Masking supported pattern matches of /.test(line)) continue;
+    if (/^Warning: A secret was passed to "sh" using Groovy String interpolation/.test(line)) continue;
+    if (/^\s*Affected argument\(s\) used the following variable\(s\):/.test(line)) continue;
+    if (/^\s*See https:\/\/jenkins\.io\/redirect\/groovy-string-interpolation/.test(line)) continue;
+    // Pulse's own callback plumbing — the shell curl + its echo confirmation
+    // are internal infrastructure, not developer-facing signal.
+    if (/^\+ curl -sS -o \/dev\/null -w %\{http_code\}.*\/api\/deployments\/callback\//.test(line)) continue;
+    if (/^Pulse callback (?:building_image|pushing_manifest|cleaning_up|image_built|manifest_pushed|completed|failed(?:_build|_manifest)?) /.test(line)) continue;
+    if (/^Discord notify: HTTP \d+/.test(line)) continue;
+    // Jenkins post-actions noise on a failed build — the tracker sidebar
+    // already surfaces failure state; these lines just repeat it.
+    if (/^ERROR: script returned exit code \d+$/.test(line)) continue;
+    if (/^\[Bitbucket\] (Notifying commit build result|Build result notified)$/.test(line)) continue;
+    if (/^Finished: (FAILURE|SUCCESS|ABORTED|UNSTABLE)$/.test(line)) continue;
     // Shell `+ cmd` → new row inside the current stage. Keep the raw
     // command as the row label so scanning down the list reads like a
     // shell transcript.
@@ -771,6 +793,22 @@ export function DeploymentBitbucketTracker({
                 logRows.map((row, i) => {
                   const expanded = isLogRowExpanded(row.label, i, logRows.length);
                   const isLatest = i === logRows.length - 1;
+                  // Failure only lands on this stage's rows when the
+                  // overall deployment failed AND the active tab is
+                  // the failing stage.
+                  const stageFailed = failed && activeStageIdx === failedAt;
+                  // Pin the X to the row whose body contains the actual
+                  // error line (kaniko exit, curl 401, ENOENT, exception,
+                  // etc.). Falls back to the last row if no row body
+                  // matches an error signature — matches the previous
+                  // "latest is the fail point" behaviour.
+                  const bodyHasError = ERROR_LINE_RE.test(row.body);
+                  const anyRowHasError = logRows.some((r) =>
+                    ERROR_LINE_RE.test(r.body),
+                  );
+                  const isFailPoint = stageFailed && (
+                    anyRowHasError ? bodyHasError : isLatest
+                  );
                   return (
                     <LogCommandRow
                       key={`${row.label}-${i}`}
@@ -778,6 +816,7 @@ export function DeploymentBitbucketTracker({
                       expanded={expanded}
                       isLatest={isLatest}
                       live={live}
+                      failed={isFailPoint}
                       onToggle={() =>
                         setManualToggles((m) => ({
                           ...m,
@@ -907,24 +946,35 @@ function LogCommandRow({
   expanded,
   isLatest,
   live,
+  failed,
   onToggle,
 }: {
   row: LogRow;
   expanded: boolean;
   isLatest: boolean;
   live: boolean;
+  failed: boolean;
   onToggle: () => void;
 }) {
-  const running = live && isLatest;
+  const running = live && isLatest && !failed;
+  const isFailPoint = failed && isLatest;
   return (
-    <div className="border-b">
+    <div
+      className={`border-b ${
+        isFailPoint
+          ? "bg-pink-100/60 dark:bg-rose-950/25 border-l-2 border-l-rose-500"
+          : ""
+      }`}
+    >
       <button
         type="button"
         onClick={onToggle}
         className="flex w-full items-center justify-between gap-3 px-4 py-2 text-left hover:bg-muted/40"
       >
         <div className="flex min-w-0 items-center gap-2">
-          {running ? (
+          {isFailPoint ? (
+            <X className="h-3.5 w-3.5 shrink-0 text-rose-600 dark:text-rose-400" />
+          ) : running ? (
             <Loader2 className="h-3 w-3 shrink-0 animate-spin text-blue-500" />
           ) : (
             <Check className="h-3 w-3 shrink-0 text-green-600" />
@@ -934,9 +984,20 @@ function LogCommandRow({
               {row.stage}
             </span>
           )}
-          <span className="truncate font-mono text-xs text-foreground">
+          <span
+            className={`truncate font-mono text-xs ${
+              isFailPoint
+                ? "text-rose-700 dark:text-rose-300 font-semibold"
+                : "text-foreground"
+            }`}
+          >
             {row.label}
           </span>
+          {isFailPoint && (
+            <span className="rounded-md bg-rose-200 px-1 py-0 text-[9px] font-medium text-rose-800 dark:bg-rose-900/40 dark:text-rose-300">
+              failed here
+            </span>
+          )}
           {running && (
             <span className="rounded-md bg-blue-100 px-1 py-0 text-[9px] font-medium text-blue-700 dark:bg-blue-900/30 dark:text-blue-400">
               running
