@@ -11,9 +11,10 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException
 
 from api.deps import require_admin
+from core.config import settings
 from models.infisical_secret_event import InfisicalSecretEvent
 from models.user import User
-from services import infisical_history
+from services import infisical, infisical_history
 
 router = APIRouter(prefix="/infisical", tags=["infisical"])
 
@@ -135,3 +136,34 @@ async def sync_now(admin: User = Depends(require_admin)):
     """Force one poll iteration on demand — useful after mass changes
     when the admin doesn't want to wait for the next tick."""
     return await infisical_history.sync_once()
+
+
+@router.get("/projects")
+async def list_projects(admin: User = Depends(require_admin)):
+    """List every Infisical project the machine identity can see.
+    Diagnostic for 'devops@ can't see all secrets' — projects here but
+    not visible in devops@'s UI are missing human membership."""
+    if not infisical.is_configured():
+        raise HTTPException(status_code=503, detail="Infisical creds not configured")
+    return await infisical.list_all_projects()
+
+
+@router.post("/backfill-members")
+async def backfill_members(admin: User = Depends(require_admin)):
+    """Add INFISICAL_AUTO_INVITE_EMAILS (default devops@seven-gen.com) to
+    EVERY existing project. Fixes projects created before the auto-invite
+    fix — machine-identity projects have zero human members, so they're
+    invisible in the UI until backfilled. Idempotent."""
+    if not infisical.is_configured():
+        raise HTTPException(status_code=503, detail="Infisical creds not configured")
+    emails = [
+        e.strip()
+        for e in getattr(settings, "INFISICAL_AUTO_INVITE_EMAILS", "").split(",")
+        if e.strip()
+    ]
+    if not emails:
+        raise HTTPException(
+            status_code=400,
+            detail="INFISICAL_AUTO_INVITE_EMAILS is empty — set it before backfilling",
+        )
+    return await infisical.backfill_members(emails)

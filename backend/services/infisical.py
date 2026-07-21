@@ -213,6 +213,81 @@ async def ensure_human_members(project_id: str, emails: Iterable[str]) -> None:
             )
 
 
+async def list_all_projects() -> list[dict]:
+    """Enumerate every project the machine identity can see.
+
+    The identity belongs to an org; we resolve the org id then list its
+    workspaces. Endpoint shapes drift across Infisical versions, so we
+    try the known variants and normalize to `[{id, slug, name}]`.
+    Returns [] on any unrecoverable API error (logged).
+    """
+    async with await _client() as c:
+        token = await _login(c)
+        h = {"Authorization": f"Bearer {token}"}
+
+        # Resolve org id. A machine identity is scoped to one org; the
+        # org listing returns it. Try v2 then v1.
+        org_id: Optional[str] = None
+        for path in ("/v2/organizations", "/v1/organization"):
+            r = await c.get(path, headers=h)
+            if r.status_code == 200:
+                body = r.json()
+                orgs = body.get("organizations") or body.get("organization") or []
+                if isinstance(orgs, dict):
+                    orgs = [orgs]
+                if orgs:
+                    org_id = orgs[0].get("id") or orgs[0].get("_id")
+                    break
+
+        projects: list[dict] = []
+        # Preferred: org-scoped workspace list.
+        if org_id:
+            r = await c.get(f"/v2/organizations/{org_id}/workspaces", headers=h)
+            if r.status_code == 200:
+                for w in (r.json().get("workspaces") or []):
+                    projects.append({
+                        "id": w.get("id") or w.get("_id"),
+                        "slug": w.get("slug"),
+                        "name": w.get("name"),
+                    })
+        # Fallback: the identity's own workspace list.
+        if not projects:
+            r = await c.get("/v1/workspace", headers=h)
+            if r.status_code == 200:
+                for w in (r.json().get("workspaces") or []):
+                    projects.append({
+                        "id": w.get("id") or w.get("_id"),
+                        "slug": w.get("slug"),
+                        "name": w.get("name"),
+                    })
+        if not projects:
+            log.warning("infisical list_all_projects: no projects resolved (org_id=%s)", org_id)
+        return [p for p in projects if p.get("id")]
+
+
+async def backfill_members(emails: Iterable[str]) -> dict:
+    """Add the given human emails to EVERY project.
+
+    Fixes the "devops@ can't see all secrets" problem: projects created
+    before the auto-invite fix (or by the machine identity outside the
+    form flow) have zero human members and are invisible in the UI.
+    This walks every project and ensures membership. Idempotent —
+    already-members are no-ops (400/409 swallowed by ensure_human_members).
+    """
+    email_list = [e for e in emails if e]
+    projects = await list_all_projects()
+    processed = 0
+    for p in projects:
+        await ensure_human_members(p["id"], email_list)
+        processed += 1
+    return {
+        "projectsFound": len(projects),
+        "projectsProcessed": processed,
+        "emails": email_list,
+        "projects": [{"slug": p.get("slug"), "name": p.get("name")} for p in projects],
+    }
+
+
 async def bootstrap_scope(
     *,
     project_slug: str,
