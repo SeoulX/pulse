@@ -22,6 +22,7 @@ from api.handlers.health import router as health_router
 from api.handlers.deployments import router as deployments_router
 from api.handlers.databases import router as databases_router
 from api.handlers.infisical import router as infisical_router
+from api.handlers.security import router as security_router
 
 
 @asynccontextmanager
@@ -110,3 +111,4 @@ app.include_router(export_router, prefix=prefix)
 app.include_router(deployments_router, prefix=prefix)
 app.include_router(databases_router, prefix=prefix)
 app.include_router(infisical_router, prefix=prefix)
+app.include_router(security_router, prefix=prefix)

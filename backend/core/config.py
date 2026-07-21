@@ -102,6 +102,21 @@ class Settings(BaseSettings):
     # identity write NOT matching this name triggers a Discord alert.
     INFISICAL_OPERATOR_IDENTITY_NAME: str = "kl"
 
+    # --- Security scanner (services/security_scanner.py) ---------------
+    # The built-in `passive` engine (security headers, TLS, cookies,
+    # banner) always runs — pure httpx, no external deps. Non-intrusive
+    # by design: only scans targets in Pulse's owned-asset allowlist.
+    SECURITY_SCAN_TIMEOUT: int = 15           # per-request seconds (passive)
+    # OWASP ZAP baseline (optional heavier engine). Needs docker reachable
+    # from the API container. Disabled by default → engine falls back to
+    # passive. The ZAP baseline profile is itself non-destructive.
+    SECURITY_SCAN_ZAP_ENABLED: bool = False
+    SECURITY_SCAN_ZAP_IMAGE: str = "ghcr.io/zaproxy/zaproxy:stable"
+    SECURITY_SCAN_ZAP_TIMEOUT: int = 600      # whole-run seconds
+    # Dedicated Discord channel for high/critical findings. Falls back
+    # to DISCORD_DB_ALERT_WEBHOOK_URL when empty.
+    DISCORD_SECURITY_WEBHOOK_URL: str = ""
+
     # Redis (cluster's redis-stack/redis-kl1-master). Pulse publishes spec.json and
     # job entries here for Jenkins to consume at bootstrap time.
     REDIS_HOST: str = "192.168.10.40"

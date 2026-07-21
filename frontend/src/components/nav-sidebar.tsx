@@ -15,6 +15,7 @@ import {
   Rocket,
   Database,
   KeyRound,
+  ShieldCheck,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 
@@ -27,6 +28,7 @@ const navItems = [
   { href: "/dashboard/deployments", label: "Deployments", icon: Rocket },
   { href: "/dashboard/databases", label: "Databases", icon: Database },
   { href: "/dashboard/infisical", label: "Secrets", icon: KeyRound },
+  { href: "/dashboard/security", label: "Security", icon: ShieldCheck },
 ];
 
 const adminItems = [
