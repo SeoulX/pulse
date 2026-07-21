@@ -79,7 +79,10 @@ def _list_projects(c: httpx.Client, h: dict) -> list[dict]:
 
 
 def _members(c: httpx.Client, h: dict, pid: str) -> list[str]:
-    r = c.get(f"/v2/workspace/{pid}/memberships", headers=h)
+    # NB: membership LISTING lives at v1 (v2 GET 404s on this Infisical
+    # build), even though the membership ADD is a v2 POST. Don't "fix"
+    # this to v2 — it'll silently report every project as MISSING.
+    r = c.get(f"/v1/workspace/{pid}/memberships", headers=h)
     if r.status_code != 200:
         return []
     out = []
@@ -134,10 +137,17 @@ def main() -> int:
             if args.apply:
                 r = c.post(f"/v2/workspace/{p['id']}/memberships",
                            headers=h, json={"emails": gap})
-                if r.status_code >= 400 and r.status_code not in (400, 409):
-                    print(f"      -> add FAILED HTTP {r.status_code}: {r.text[:200]}")
+                # Infisical sometimes returns 500 from a SECONDARY step
+                # (e.g. invite email) AFTER the membership actually landed.
+                # Verify against the real membership list rather than
+                # trusting the status code.
+                after = _members(c, h, p["id"])
+                still = [e for e in gap if e not in after]
+                if not still:
+                    print("      -> added")
                 else:
-                    print(f"      -> added")
+                    print(f"      -> add FAILED HTTP {r.status_code} "
+                          f"(still missing {','.join(still)}): {r.text[:160]}")
 
     print(f"\nprojects with gaps: {missing_total} / {len(projects)}")
     if args.check and missing_total:
