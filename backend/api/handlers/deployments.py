@@ -497,6 +497,19 @@ async def _backfill_repo_logic(repo_slug: str) -> dict:
     inserted = 0
     skipped = 0
     workspace = settings.BITBUCKET_WORKSPACE
+
+    # Inherit cluster + workload spec from the newest existing record so a
+    # backfill of a kl-2 app doesn't stamp every synthetic tag with the
+    # kl-1 default (same bug that made daedalus-engine auto-deploy to kl-1).
+    # Prefer a real form record over a prior manual_tag guess.
+    _seed = None
+    for d in sorted(existing, key=lambda r: r.created_at, reverse=True):
+        if d.origin == "form":
+            _seed = d
+            break
+    if _seed is None and existing:
+        _seed = max(existing, key=lambda r: r.created_at)
+
     for t in tags:
         name = t.get("name") or ""
         env = _env_for_tag(name)
@@ -518,14 +531,23 @@ async def _backfill_repo_logic(repo_slug: str) -> dict:
 
         dep = DeploymentRequest(
             repo_slug=repo_slug,
-            repo_url=f"https://bitbucket.org/{workspace}/{repo_slug}.git",
-            team="Backend",
-            workload_kind="Deployment",
-            role=None,
-            cluster="kl-1",
+            repo_url=(
+                _seed.repo_url if _seed else
+                f"https://bitbucket.org/{workspace}/{repo_slug}.git"
+            ),
+            team=_seed.team if _seed else "Backend",
+            workload_kind=_seed.workload_kind if _seed else "Deployment",
+            role=_seed.role if _seed else None,
+            with_worker=_seed.with_worker if _seed else False,
+            cluster=_seed.cluster if _seed else "kl-1",
             environments=[env],
             env_vars={},
-            domain_zone="media-meter.in",
+            domain_zone=_seed.domain_zone if _seed else "media-meter.in",
+            port=_seed.port if _seed else 8000,
+            components=_seed.components if _seed else None,
+            image_target=_seed.image_target if _seed else None,
+            needs_ingress=_seed.needs_ingress if _seed else None,
+            secrets_enabled=_seed.secrets_enabled if _seed else False,
             requested_by="backfill@pulse",
             status="completed",
             origin="manual_tag",
@@ -1551,16 +1573,41 @@ async def pipeline_callback(repo_slug: str, body: PipelineCallback):
             # for form-flow records). Falls back to `jenkins@ci`
             # when Bitbucket is unreachable or the author is missing.
             author = await get_tag_author_email(repo_slug, body.tag)
+
+            # Inherit cluster + workload spec from the most-recent PRIOR
+            # record for this repo (any env, any status). Without this the
+            # synthetic record hardcoded cluster="kl-1"/Deployment, so a
+            # manual retag of a kl-2 app (e.g. daedalus-engine) made /spec
+            # return kl-1 and Jenkins wrote the manifest into the wrong
+            # cluster tree — "auto-deploys to kl-1". A repo that was ever
+            # deployed through the form already carries its true cluster;
+            # reuse it. Fall back to kl-1/Deployment only for a repo Pulse
+            # has genuinely never seen.
+            prior = await DeploymentRequest.find_one(
+                DeploymentRequest.repo_slug == repo_slug,
+                sort=[("createdAt", -1)],
+            )
             dep = DeploymentRequest(
                 repo_slug=repo_slug,
-                repo_url=f"https://bitbucket.org/{settings.BITBUCKET_WORKSPACE}/{repo_slug}.git",
-                team="Backend",
-                workload_kind="Deployment",
-                role=None,
-                cluster="kl-1",
+                repo_url=(
+                    prior.repo_url if prior else
+                    f"https://bitbucket.org/{settings.BITBUCKET_WORKSPACE}/{repo_slug}.git"
+                ),
+                team=prior.team if prior else "Backend",
+                workload_kind=prior.workload_kind if prior else "Deployment",
+                role=prior.role if prior else None,
+                with_worker=prior.with_worker if prior else False,
+                cluster=prior.cluster if prior else "kl-1",
                 environments=[body.env],
                 env_vars={},
-                domain_zone="media-meter.in",
+                domain_zone=prior.domain_zone if prior else "media-meter.in",
+                port=prior.port if prior else 8000,
+                # Carry the monorepo/scaledjob spec so generate-manifests
+                # routes the orphan build the same way the original did.
+                components=prior.components if prior else None,
+                image_target=prior.image_target if prior else None,
+                needs_ingress=prior.needs_ingress if prior else None,
+                secrets_enabled=prior.secrets_enabled if prior else False,
                 requested_by=author or "jenkins@ci",
                 status=body.status,
                 origin="manual_tag",
@@ -1571,6 +1618,13 @@ async def pipeline_callback(repo_slug: str, body: PipelineCallback):
                 latest_jenkins_console_url=body.jenkins_console_url,
             )
             await dep.insert()
+            if prior:
+                print(
+                    f"[PIPELINE CALLBACK] {repo_slug} tag={body.tag} — orphan "
+                    f"inherited cluster={dep.cluster} kind={dep.workload_kind} "
+                    f"from prior record {prior.id}",
+                    flush=True,
+                )
             print(
                 f"[PIPELINE CALLBACK] {repo_slug} tag={body.tag} env={body.env}"
                 f" — orphan-tag record synthesized (id={dep.id})",
