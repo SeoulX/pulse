@@ -21,7 +21,7 @@ from __future__ import annotations
 import asyncio
 import ssl
 from datetime import datetime, timezone
-from typing import List
+from typing import List, Optional
 from urllib.parse import urlparse
 
 import httpx
@@ -219,12 +219,21 @@ async def _maybe_alert(scan: SecurityScan) -> None:
         await client.post(webhook, json=payload)
 
 
-async def dispatch_scan(scan: SecurityScan) -> None:
+async def dispatch_scan(
+    scan: SecurityScan,
+    auth_headers: Optional[list[str]] = None,
+) -> None:
     """Route to the requested engine. Passive is always available; nuclei
     and ZAP require their container + the matching *_ENABLED flag, and
-    degrade to passive when unavailable."""
+    degrade to passive when unavailable.
+
+    `auth_headers` (nuclei only) are per-scan request headers — e.g.
+    ["Authorization: Bearer <test-jwt>", "Cookie: session=..."] — so the
+    scan reaches behind login. They are NEVER persisted on the scan doc
+    (they're credentials); they only live for the duration of this run.
+    """
     if scan.engine == "nuclei" and settings.SECURITY_SCAN_NUCLEI_ENABLED:
-        await _run_nuclei_scan(scan)
+        await _run_nuclei_scan(scan, auth_headers=auth_headers)
     elif scan.engine == "zap" and settings.SECURITY_SCAN_ZAP_ENABLED:
         await _run_zap_scan(scan)
     else:
@@ -252,7 +261,7 @@ def _nuclei_mode() -> str:
     return "local"
 
 
-async def _nuclei_exec_in_pod(cmd: list, timeout: float) -> bytes:
+async def _nuclei_exec_in_pod(cmd: list, timeout: float, on_line=None) -> bytes:
     """Exec `cmd` in the nuclei runner POD over the Kubernetes API.
 
     Prod path: the kl-1/nuclei Deployment runs a long-lived pod; Pulse's
@@ -260,6 +269,10 @@ async def _nuclei_exec_in_pod(cmd: list, timeout: float) -> bytes:
     exec against it. Uses the kubernetes client; the blocking stream runs
     off-thread. Raises on missing pod / RBAC so the caller degrades to
     passive.
+
+    `on_line`, when given, is called with each COMPLETE stdout line as it
+    arrives (thread context) — used to stream findings live instead of
+    waiting for the whole run. The full bytes are still returned.
     """
     from kubernetes import client, config as k8s_config  # optional dep
     from kubernetes.stream import stream
@@ -301,11 +314,28 @@ async def _nuclei_exec_in_pod(cmd: list, timeout: float) -> bytes:
             _preload_content=False,
         )
         out = bytearray()
-        # Drain the stream until the exec finishes.
+        line_buf = bytearray()
+        # Drain the stream until the exec finishes, emitting complete
+        # lines as they arrive so findings stream live.
         while resp.is_open():
             resp.update(timeout=1)
             if resp.peek_stdout():
-                out.extend(resp.read_stdout().encode("utf-8", "replace"))
+                chunk = resp.read_stdout().encode("utf-8", "replace")
+                out.extend(chunk)
+                if on_line is not None:
+                    line_buf.extend(chunk)
+                    while b"\n" in line_buf:
+                        raw, _, rest = line_buf.partition(b"\n")
+                        line_buf = bytearray(rest)
+                        try:
+                            on_line(raw.decode("utf-8", "replace"))
+                        except Exception:
+                            pass
+        if on_line is not None and line_buf:
+            try:
+                on_line(line_buf.decode("utf-8", "replace"))
+            except Exception:
+                pass
         resp.close()
         return bytes(out)
 
@@ -334,119 +364,162 @@ async def _nuclei_exec_in_container(container: str, cmd: list, timeout: float) -
     return await asyncio.wait_for(asyncio.to_thread(_run), timeout=timeout)
 
 
-async def _run_nuclei_scan(scan: SecurityScan) -> None:
-    """ProjectDiscovery Nuclei — real active template-based vuln scan.
-
-    Runs the nuclei container against the target with JSONL output, a
-    request rate limit, and a severity filter. Each JSON line becomes a
-    Finding. Templates are detection-oriented (CVEs, misconfigurations,
-    exposures, default credentials) rather than destructive exploits —
-    still, we only ever point it at Pulse-owned assets (enforced upstream
-    by the allowlist) and cap the request rate. Degrades to passive on
-    any failure so a scan always returns something useful.
-    """
+def _parse_nuclei_line(line: str) -> Optional[Finding]:
+    """Turn one nuclei -jsonl stdout line into a Finding, or None."""
     import json
-    import shutil
+    line = line.strip()
+    if not line or not line.startswith("{"):
+        return None
+    try:
+        obj = json.loads(line)
+    except json.JSONDecodeError:
+        return None
+    info = obj.get("info") or {}
+    sev = (info.get("severity") or "info").lower()
+    if sev not in _NUCLEI_SEV:
+        sev = "info"
+    classification = info.get("classification") or {}
+    cve = ", ".join(classification.get("cve-id") or []) if classification else ""
+    remediation = info.get("remediation") or (
+        f"Review + patch. Template: {obj.get('template-id', '?')}."
+        + (f" CVE: {cve}." if cve else "")
+    )
+    return Finding(
+        rule_id=f"nuclei-{obj.get('template-id', 'x')}",
+        severity=sev,  # type: ignore[arg-type]
+        title=info.get("name") or obj.get("template-id") or "Nuclei finding",
+        detail=(info.get("description") or "")[:600],
+        evidence=obj.get("matched-at") or obj.get("host"),
+        remediation=remediation[:600],
+        engine="nuclei",
+    )
 
-    scan.status = "running"
-    scan.started_at = datetime.now(timezone.utc)
-    await scan.save()
 
-    # Prefer a nuclei BINARY on PATH (baked into the image / installed) —
-    # portable + works in k8s. Fall back to `docker run` only when the
-    # binary is absent AND a docker socket is reachable.
-    nuclei_args = [
+def _build_nuclei_args(scan: SecurityScan, auth_headers: Optional[list[str]]) -> list[str]:
+    """Assemble the nuclei CLI args. `profile=deep` on the scan widens the
+    template set + severity; otherwise the FAST config defaults apply."""
+    deep = getattr(scan, "profile", "fast") == "deep"
+    severity = (
+        "info,low,medium,high,critical" if deep
+        else settings.SECURITY_SCAN_NUCLEI_SEVERITY
+    )
+    args = [
         "-u", scan.target_url,
-        "-jsonl",                                   # one JSON object per line
-        "-silent",                                  # suppress banner/progress
-        "-no-color",
-        "-severity", settings.SECURITY_SCAN_NUCLEI_SEVERITY,
-        # --- speed flags ---
+        "-jsonl", "-silent", "-no-color",
+        "-severity", severity,
         "-rate-limit", str(settings.SECURITY_SCAN_NUCLEI_RATE),
         "-c", str(settings.SECURITY_SCAN_NUCLEI_CONCURRENCY),
         "-timeout", str(settings.SECURITY_SCAN_NUCLEI_REQ_TIMEOUT),
         "-retries", str(settings.SECURITY_SCAN_NUCLEI_RETRIES),
-        "-disable-update-check",                    # no version-check round-trip
-        "-duc",                                     # no template auto-update mid-scan
+        "-disable-update-check", "-duc",
     ]
-    # FAST profile: scope to high-signal template dirs (~10x fewer than the
-    # full set). Empty → run everything (deep audit).
-    for t in settings.SECURITY_SCAN_NUCLEI_TEMPLATES.split(","):
-        t = t.strip()
-        if t:
-            nuclei_args += ["-t", t]
+    # Template scope. Deep = all templates (omit -t); fast = scoped dirs.
+    if not deep:
+        for t in settings.SECURITY_SCAN_NUCLEI_TEMPLATES.split(","):
+            t = t.strip()
+            if t:
+                args += ["-t", t]
     if settings.SECURITY_SCAN_NUCLEI_TAGS.strip():
-        nuclei_args += ["-tags", settings.SECURITY_SCAN_NUCLEI_TAGS.strip()]
+        args += ["-tags", settings.SECURITY_SCAN_NUCLEI_TAGS.strip()]
     if settings.SECURITY_SCAN_NUCLEI_EXCLUDE_TAGS.strip():
-        nuclei_args += ["-etags", settings.SECURITY_SCAN_NUCLEI_EXCLUDE_TAGS.strip()]
+        args += ["-etags", settings.SECURITY_SCAN_NUCLEI_EXCLUDE_TAGS.strip()]
     if settings.SECURITY_SCAN_NUCLEI_NO_INTERACTSH:
-        nuclei_args += ["-no-interactsh"]
+        args += ["-no-interactsh"]
+    # Auth-aware: per-scan request headers so nuclei reaches behind login.
+    # Passed as -H "Key: Value" argv pairs (no shell — no injection risk).
+    for h in (auth_headers or []):
+        h = h.strip()
+        if h and ":" in h:
+            args += ["-H", h]
+    return args
 
+
+async def _run_nuclei_scan(
+    scan: SecurityScan,
+    auth_headers: Optional[list[str]] = None,
+) -> None:
+    """ProjectDiscovery Nuclei — real active template-based vuln scan.
+
+    Streams findings LIVE: each JSONL line nuclei emits is parsed and
+    appended to the scan (throttled saves) + logged, so the UI's polling
+    view and `kubectl logs -f` both show findings as they're discovered
+    rather than only at the end. Degrades to passive on any failure.
+    """
+    import shutil
+
+    scan.status = "running"
+    scan.started_at = datetime.now(timezone.utc)
+    scan.findings = []
+    await scan.save()
+
+    nuclei_args = _build_nuclei_args(scan, auth_headers)
     timeout = float(settings.SECURITY_SCAN_NUCLEI_TIMEOUT)
     mode = _nuclei_mode()
-    try:
-        if mode == "k8s":
-            # Prod: exec into the nuclei runner POD over the k8s API.
-            stdout = await _nuclei_exec_in_pod(["nuclei", *nuclei_args], timeout)
-        elif mode == "docker" and settings.SECURITY_SCAN_NUCLEI_CONTAINER:
-            # Local docker-compose: exec into the sidecar over the Docker API.
-            stdout = await _nuclei_exec_in_container(
-                settings.SECURITY_SCAN_NUCLEI_CONTAINER,
-                ["nuclei", *nuclei_args], timeout,
-            )
-        else:
-            # Local fallbacks: nuclei binary on PATH, else `docker run`.
-            if shutil.which("nuclei"):
-                cmd = ["nuclei", *nuclei_args]
+
+    loop = asyncio.get_running_loop()
+    queue: asyncio.Queue = asyncio.Queue()
+
+    def _emit(line: str) -> None:
+        # Thread-safe hand-off from the exec thread to the async consumer.
+        loop.call_soon_threadsafe(queue.put_nowait, line)
+
+    async def _producer() -> None:
+        try:
+            if mode == "k8s":
+                await _nuclei_exec_in_pod(["nuclei", *nuclei_args], timeout, on_line=_emit)
+            elif mode == "docker" and settings.SECURITY_SCAN_NUCLEI_CONTAINER:
+                # Container path returns bytes; emit its lines after the run.
+                out = await _nuclei_exec_in_container(
+                    settings.SECURITY_SCAN_NUCLEI_CONTAINER,
+                    ["nuclei", *nuclei_args], timeout,
+                )
+                for ln in out.decode("utf-8", "replace").splitlines():
+                    _emit(ln)
             else:
-                cmd = [
-                    "docker", "run", "--rm", "--network", "host",
-                    settings.SECURITY_SCAN_NUCLEI_IMAGE, *nuclei_args,
-                ]
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            raw, _stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-            stdout = raw
+                cmd = (["nuclei", *nuclei_args] if shutil.which("nuclei")
+                       else ["docker", "run", "--rm", "--network", "host",
+                             settings.SECURITY_SCAN_NUCLEI_IMAGE, *nuclei_args])
+                proc = await asyncio.create_subprocess_exec(
+                    *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+                )
+                assert proc.stdout is not None
+                async for raw in proc.stdout:               # live per-line
+                    _emit(raw.decode("utf-8", "replace"))
+                await asyncio.wait_for(proc.wait(), timeout=timeout)
+        finally:
+            loop.call_soon_threadsafe(queue.put_nowait, None)  # sentinel
 
-        findings: List[Finding] = []
-        for line in stdout.decode("utf-8", "replace").splitlines():
-            line = line.strip()
-            if not line or not line.startswith("{"):
+    prod = asyncio.create_task(_producer())
+    findings: List[Finding] = []
+    last_save = 0.0
+    try:
+        import time as _t
+        while True:
+            line = await queue.get()
+            if line is None:
+                break
+            f = _parse_nuclei_line(line)
+            if not f:
                 continue
-            try:
-                obj = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            info = obj.get("info") or {}
-            sev = (info.get("severity") or "info").lower()
-            if sev not in _NUCLEI_SEV:
-                sev = "info"
-            # Nuclei classification / remediation live under info.*
-            classification = info.get("classification") or {}
-            cve = ", ".join(classification.get("cve-id") or []) if classification else ""
-            remediation = info.get("remediation") or (
-                f"Review + patch. Template: {obj.get('template-id', '?')}."
-                + (f" CVE: {cve}." if cve else "")
+            findings.append(f)
+            scan.findings = findings
+            scan.recompute()
+            log.info(
+                "nuclei finding [%s] %s @ %s (%s, %d so far)",
+                f.severity, f.title, f.evidence, scan.target_label, len(findings),
             )
-            findings.append(Finding(
-                rule_id=f"nuclei-{obj.get('template-id', 'x')}",
-                severity=sev,  # type: ignore[arg-type]
-                title=info.get("name") or obj.get("template-id") or "Nuclei finding",
-                detail=(info.get("description") or "")[:600],
-                evidence=obj.get("matched-at") or obj.get("host"),
-                remediation=remediation[:600],
-                engine="nuclei",
-            ))
-
+            # Throttle DB writes to ~1/2s so a burst of findings doesn't
+            # hammer mongo; the UI polls every 2.5s anyway.
+            now = _t.monotonic()
+            if now - last_save > 2:
+                await scan.save()
+                last_save = now
+        await prod  # surface producer exceptions
         scan.findings = findings
         scan.recompute()
         scan.status = "completed"
     except Exception as e:
-        # Nuclei / docker unavailable → run the always-on passive engine so
-        # the scan still yields posture findings.
+        prod.cancel()
         scan.error = f"nuclei unavailable ({e.__class__.__name__}); ran passive instead"
         scan.engine = "passive"
         await run_passive_scan(scan)

@@ -94,6 +94,7 @@ def _serialize(scan: SecurityScan, *, full: bool = False) -> dict:
         "targetLabel": scan.target_label,
         "targetUrl": scan.target_url,
         "engine": scan.engine,
+        "profile": getattr(scan, "profile", "fast"),
         "status": scan.status,
         "error": scan.error,
         "severityCounts": scan.severity_counts,
@@ -133,6 +134,13 @@ async def list_targets(user: User = Depends(get_current_user)):
 class CreateScanRequest(BaseModel):
     target_url: str = Field(alias="targetUrl")
     engine: str = "passive"
+    # nuclei depth: "fast" (scoped, ~1min) | "deep" (all templates, ~10-15min)
+    profile: str = "fast"
+    # Optional per-scan request headers for auth-aware scanning — reach
+    # BEHIND login (IDOR/auth-bypass/injection live there). Each item is a
+    # raw header, e.g. "Authorization: Bearer <test-jwt>" or "Cookie: ...".
+    # NEVER persisted on the scan doc (they're credentials).
+    auth_headers: list[str] = Field(default_factory=list, alias="authHeaders")
 
     model_config = {"populate_by_name": True}
 
@@ -150,6 +158,8 @@ async def create_scan(body: CreateScanRequest, admin: User = Depends(require_adm
         )
     if body.engine not in ("passive", "zap", "nuclei"):
         raise HTTPException(status_code=400, detail="engine must be 'passive', 'nuclei', or 'zap'")
+    if body.profile not in ("fast", "deep"):
+        raise HTTPException(status_code=400, detail="profile must be 'fast' or 'deep'")
 
     scan = SecurityScan(
         target_kind=target.kind,
@@ -157,14 +167,16 @@ async def create_scan(body: CreateScanRequest, admin: User = Depends(require_adm
         target_label=target.label,
         target_url=target.url,
         engine=body.engine,
+        profile=body.profile,          # type: ignore[arg-type]
         status="queued",
         requested_by=admin.email,
     )
     await scan.insert()
 
-    # Fire-and-forget — the scan runs in the background, the client
-    # polls GET /security/scans/{id} for progress.
-    asyncio.create_task(dispatch_scan(scan))
+    # Fire-and-forget — the scan runs in the background, the client polls
+    # GET /security/scans/{id} for progress (findings stream in live).
+    # auth_headers are passed to the task only, never stored on the doc.
+    asyncio.create_task(dispatch_scan(scan, auth_headers=body.auth_headers))
 
     return _serialize(scan)
 

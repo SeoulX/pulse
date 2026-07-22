@@ -40,6 +40,7 @@ interface Scan {
   targetLabel: string;
   targetUrl: string;
   engine: string;
+  profile?: string;
   status: string;
   error: string | null;
   severityCounts: Record<string, number>;
@@ -78,6 +79,8 @@ export default function SecurityPage() {
   const [scans, setScans] = useState<Scan[]>([]);
   const [selectedUrl, setSelectedUrl] = useState<string>("");
   const [engine, setEngine] = useState<"passive" | "nuclei" | "zap">("passive");
+  const [profile, setProfile] = useState<"fast" | "deep">("fast");
+  const [authHeader, setAuthHeader] = useState("");
   const [launching, setLaunching] = useState(false);
   const [detail, setDetail] = useState<Scan | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -121,7 +124,12 @@ export default function SecurityPage() {
       const res = await apiFetch("/api/security/scans", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ targetUrl: selectedUrl, engine }),
+        body: JSON.stringify({
+          targetUrl: selectedUrl,
+          engine,
+          profile,
+          authHeaders: authHeader.trim() ? [authHeader.trim()] : [],
+        }),
       });
       if (!res.ok) {
         const body = await res.json().catch(() => ({}));
@@ -138,6 +146,18 @@ export default function SecurityPage() {
     const res = await apiFetch(`/api/security/scans/${id}`);
     if (res.ok) setDetail(await res.json());
   };
+
+  // Live-stream the open scan: while it's running/queued, re-fetch the
+  // detail every 2s so findings + severity counts fill in as Nuclei
+  // discovers them (backend saves incrementally).
+  useEffect(() => {
+    if (!detail || (detail.status !== "running" && detail.status !== "queued")) return;
+    const id = setInterval(async () => {
+      const res = await apiFetch(`/api/security/scans/${detail._id}`);
+      if (res.ok) setDetail(await res.json());
+    }, 2000);
+    return () => clearInterval(id);
+  }, [detail]);
 
   return (
     <div className="mx-auto max-w-6xl">
@@ -202,6 +222,19 @@ export default function SecurityPage() {
               <option value="zap">OWASP ZAP baseline (if enabled)</option>
             </select>
           </label>
+          {engine === "nuclei" && (
+            <label className="flex flex-col gap-1">
+              <span className="text-xs text-muted-foreground">Depth</span>
+              <select
+                value={profile}
+                onChange={(e) => setProfile(e.target.value as "fast" | "deep")}
+                className="rounded-xl border bg-background px-3 py-2 text-sm"
+              >
+                <option value="fast">Fast (scoped templates · ~1 min)</option>
+                <option value="deep">Deep (all templates + info · ~10-15 min)</option>
+              </select>
+            </label>
+          )}
           <button
             onClick={launch}
             disabled={launching || !selectedUrl}
@@ -215,6 +248,25 @@ export default function SecurityPage() {
             Run scan
           </button>
         </div>
+        {engine === "nuclei" && (
+          <div className="mt-3">
+            <label className="flex flex-col gap-1">
+              <span className="text-xs text-muted-foreground">
+                Auth header (optional — scan behind login)
+              </span>
+              <input
+                value={authHeader}
+                onChange={(e) => setAuthHeader(e.target.value)}
+                placeholder="Authorization: Bearer <test-jwt>   or   Cookie: session=…"
+                className="w-full rounded-xl border bg-background px-3 py-2 font-mono text-xs"
+              />
+            </label>
+            <p className="mt-1 text-[11px] text-muted-foreground">
+              Sent with every request so Nuclei reaches authenticated endpoints.
+              Not stored — used only for this run.
+            </p>
+          </div>
+        )}
         {targets.length === 0 && (
           <p className="mt-3 text-xs text-muted-foreground">
             No scannable targets yet — deploy an app or add an http endpoint first.
@@ -309,8 +361,21 @@ export default function SecurityPage() {
           >
             <div className="mb-4 flex items-start justify-between">
               <div>
-                <div className="text-lg font-bold">{detail.targetLabel}</div>
+                <div className="flex items-center gap-2 text-lg font-bold">
+                  {detail.targetLabel}
+                  <span className="rounded bg-muted px-1.5 py-0.5 text-[10px] uppercase">
+                    {detail.engine}
+                    {detail.engine === "nuclei" && detail.profile ? ` · ${detail.profile}` : ""}
+                  </span>
+                </div>
                 <div className="text-xs text-muted-foreground">{detail.targetUrl}</div>
+                {(detail.status === "running" || detail.status === "queued") && (
+                  <div className="mt-1 flex items-center gap-2 text-xs text-amber-500">
+                    <Loader2 className="h-3 w-3 animate-spin" />
+                    scanning… {detail.findingCount} finding
+                    {detail.findingCount === 1 ? "" : "s"} so far (live)
+                  </div>
+                )}
               </div>
               <button onClick={() => setDetail(null)}>
                 <X className="h-5 w-5" />

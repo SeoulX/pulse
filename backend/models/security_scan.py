@@ -47,6 +47,9 @@ class SecurityScan(Document):
     target_url: Indexed(str) = Field(alias="targetUrl")
 
     engine: ScanEngine = "passive"
+    # Scan depth (nuclei): fast = scoped high-signal templates (~1min);
+    # deep = full template set + info severity (~10-15min).
+    profile: Literal["fast", "deep"] = "fast"
     status: ScanStatus = "queued"
     error: Optional[str] = None
 
