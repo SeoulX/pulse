@@ -192,8 +192,17 @@ export default function SecurityPage() {
 
       {/* Launch panel */}
       <div className="mb-8 rounded-2xl border bg-card p-5">
-        <div className="mb-3 text-xs font-semibold uppercase tracking-widest text-muted-foreground">
-          New scan
+        <div className="mb-3 flex items-center justify-between gap-3">
+          <div className="text-xs font-semibold uppercase tracking-widest text-muted-foreground">
+            New scan
+          </div>
+          <button
+            type="button"
+            onClick={() => { setCustomMode((v) => !v); setSelectedUrl(""); }}
+            className="text-[11px] font-medium text-[#e8871e] hover:underline dark:text-[#5ab4c5]"
+          >
+            {customMode ? "← pick from owned assets" : "not listed? paste a URL →"}
+          </button>
         </div>
         <div className="flex flex-wrap items-end gap-3">
           <label className="flex flex-col gap-1">
@@ -205,13 +214,13 @@ export default function SecurityPage() {
                 value={selectedUrl}
                 onChange={(e) => setSelectedUrl(e.target.value)}
                 placeholder="https://your-app.media-meter.in"
-                className="min-w-72 rounded-xl border bg-background px-3 py-2 font-mono text-sm"
+                className="h-[38px] min-w-72 rounded-xl border bg-background px-3 py-2 font-mono text-sm"
               />
             ) : (
               <select
                 value={selectedUrl}
                 onChange={(e) => setSelectedUrl(e.target.value)}
-                className="min-w-72 rounded-xl border bg-background px-3 py-2 text-sm"
+                className="h-[38px] min-w-72 rounded-xl border bg-background px-3 py-2 text-sm"
               >
                 <option value="">Select a target…</option>
                 {targets.map((t) => (
@@ -221,20 +230,13 @@ export default function SecurityPage() {
                 ))}
               </select>
             )}
-            <button
-              type="button"
-              onClick={() => { setCustomMode((v) => !v); setSelectedUrl(""); }}
-              className="mt-0.5 self-start text-[11px] text-[#e8871e] hover:underline dark:text-[#5ab4c5]"
-            >
-              {customMode ? "← pick from owned assets" : "not listed? paste a URL →"}
-            </button>
           </label>
           <label className="flex flex-col gap-1">
             <span className="text-xs text-muted-foreground">Engine</span>
             <select
               value={engine}
               onChange={(e) => setEngine(e.target.value as "passive" | "nuclei" | "zap")}
-              className="rounded-xl border bg-background px-3 py-2 text-sm"
+              className="h-[38px] rounded-xl border bg-background px-3 py-2 text-sm"
             >
               <option value="passive">Passive (built-in · headers/TLS/cookies · non-intrusive)</option>
               <option value="nuclei">Nuclei (active vuln scan · CVEs/misconfig · if enabled)</option>
@@ -247,7 +249,7 @@ export default function SecurityPage() {
               <select
                 value={profile}
                 onChange={(e) => setProfile(e.target.value as "fast" | "deep")}
-                className="rounded-xl border bg-background px-3 py-2 text-sm"
+                className="h-[38px] rounded-xl border bg-background px-3 py-2 text-sm"
               >
                 <option value="fast">Fast (scoped templates · ~1 min)</option>
                 <option value="deep">Deep (all templates + info · ~10-15 min)</option>
@@ -257,7 +259,7 @@ export default function SecurityPage() {
           <button
             onClick={launch}
             disabled={launching || !selectedUrl}
-            className="flex items-center gap-2 rounded-xl bg-[#e8871e] px-4 py-2 text-sm font-semibold text-white disabled:opacity-50 dark:bg-[#2a7f9e]"
+            className="flex h-[38px] items-center gap-2 rounded-xl bg-[#e8871e] px-4 text-sm font-semibold text-white disabled:opacity-50 dark:bg-[#2a7f9e]"
           >
             {launching ? (
               <Loader2 className="h-4 w-4 animate-spin" />
