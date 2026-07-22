@@ -19,6 +19,7 @@ it's handed is owned.
 from __future__ import annotations
 
 import asyncio
+import logging
 import ssl
 from datetime import datetime, timezone
 from typing import List, Optional
@@ -28,6 +29,8 @@ import httpx
 
 from core.config import settings
 from models.security_scan import Finding, SecurityScan
+
+log = logging.getLogger(__name__)
 
 # Security response headers we expect a hardened app to set, with the
 # severity assigned when they're missing + the fix hint.
@@ -244,6 +247,7 @@ async def dispatch_scan(
 
 # Nuclei severity strings map 1:1 onto our ladder.
 _NUCLEI_SEV = {"critical", "high", "medium", "low", "info"}
+_SEV_RANK = {"critical": 4, "high": 3, "medium": 2, "low": 1, "info": 0}
 
 
 def _nuclei_mode() -> str:
@@ -491,6 +495,7 @@ async def _run_nuclei_scan(
 
     prod = asyncio.create_task(_producer())
     findings: List[Finding] = []
+    by_rule: dict = {}     # rule_id → Finding (dedup; merge evidence)
     last_save = 0.0
     try:
         import time as _t
@@ -501,11 +506,27 @@ async def _run_nuclei_scan(
             f = _parse_nuclei_line(line)
             if not f:
                 continue
+            # Dedup: a template that fires N times (e.g. missing-headers,
+            # once per header) collapses into ONE finding with the
+            # evidence list appended, instead of N near-identical rows.
+            existing = by_rule.get(f.rule_id)
+            if existing is not None:
+                if f.evidence and f.evidence not in (existing.evidence or ""):
+                    merged = (existing.evidence or "")
+                    # keep it bounded
+                    if len(merged) < 500:
+                        existing.evidence = (merged + " · " + f.evidence).lstrip(" ·")
+                if _SEV_RANK.get(f.severity, 0) > _SEV_RANK.get(existing.severity, 0):
+                    existing.severity = f.severity
+                scan.findings = findings
+                scan.recompute()
+                continue
+            by_rule[f.rule_id] = f
             findings.append(f)
             scan.findings = findings
             scan.recompute()
             log.info(
-                "nuclei finding [%s] %s @ %s (%s, %d so far)",
+                "nuclei finding [%s] %s @ %s (%s, %d unique)",
                 f.severity, f.title, f.evidence, scan.target_label, len(findings),
             )
             # Throttle DB writes to ~1/2s so a burst of findings doesn't
