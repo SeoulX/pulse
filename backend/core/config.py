@@ -121,6 +121,19 @@ class Settings(BaseSettings):
     SECURITY_SCAN_NUCLEI_ENABLED: bool = False
     SECURITY_SCAN_NUCLEI_IMAGE: str = "projectdiscovery/nuclei:latest"
     SECURITY_SCAN_NUCLEI_TIMEOUT: int = 900   # whole-run seconds
+    # Independent nuclei deployment — how Pulse reaches the runner.
+    #   docker : exec into SECURITY_SCAN_NUCLEI_CONTAINER over the Docker
+    #            API (local docker-compose sidecar).
+    #   k8s    : exec into a pod (label selector) in a namespace over the
+    #            Kubernetes API (prod — the kl-1/nuclei Deployment).
+    #   auto   : k8s when a service-account token is mounted, else docker,
+    #            else local binary / `docker run`.
+    SECURITY_SCAN_NUCLEI_MODE: str = "auto"
+    # docker mode: name of the long-lived nuclei container to exec into.
+    SECURITY_SCAN_NUCLEI_CONTAINER: str = ""
+    # k8s mode: where the nuclei runner pod lives + how to find it.
+    SECURITY_SCAN_NUCLEI_K8S_NAMESPACE: str = "pulse-api"
+    SECURITY_SCAN_NUCLEI_K8S_SELECTOR: str = "app=nuclei"
     SECURITY_SCAN_NUCLEI_RATE: int = 50       # max requests/sec (-rl)
     SECURITY_SCAN_NUCLEI_SEVERITY: str = "low,medium,high,critical"  # skip info noise
     # Optional extra template tags/filters (e.g. "cves,exposures,misconfig").

@@ -16,3 +16,5 @@ redis==5.1.1
 pyyaml==6.0.2
 asyncpg==0.30.0
 aiokafka==0.11.0
+kubernetes>=29.0.0
+docker>=7.0.0

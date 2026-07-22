@@ -237,6 +237,84 @@ async def dispatch_scan(scan: SecurityScan) -> None:
 _NUCLEI_SEV = {"critical", "high", "medium", "low", "info"}
 
 
+def _nuclei_mode() -> str:
+    """Resolve the effective nuclei runner mode.
+    `auto` → k8s when running in-cluster (SA token mounted), else docker
+    when a container name is set, else local (binary / docker run)."""
+    mode = settings.SECURITY_SCAN_NUCLEI_MODE
+    if mode != "auto":
+        return mode
+    import os
+    if os.path.exists("/var/run/secrets/kubernetes.io/serviceaccount/token"):
+        return "k8s"
+    if settings.SECURITY_SCAN_NUCLEI_CONTAINER:
+        return "docker"
+    return "local"
+
+
+async def _nuclei_exec_in_pod(cmd: list, timeout: float) -> bytes:
+    """Exec `cmd` in the nuclei runner POD over the Kubernetes API.
+
+    Prod path: the kl-1/nuclei Deployment runs a long-lived pod; Pulse's
+    in-cluster ServiceAccount (bound to the nuclei-exec Role) streams an
+    exec against it. Uses the kubernetes client; the blocking stream runs
+    off-thread. Raises on missing pod / RBAC so the caller degrades to
+    passive.
+    """
+    from kubernetes import client, config as k8s_config  # optional dep
+    from kubernetes.stream import stream
+
+    ns = settings.SECURITY_SCAN_NUCLEI_K8S_NAMESPACE
+    selector = settings.SECURITY_SCAN_NUCLEI_K8S_SELECTOR
+
+    def _run() -> bytes:
+        k8s_config.load_incluster_config()
+        v1 = client.CoreV1Api()
+        pods = v1.list_namespaced_pod(ns, label_selector=selector).items
+        ready = [p for p in pods if (p.status and p.status.phase == "Running")]
+        if not ready:
+            raise RuntimeError(f"no running nuclei pod ({selector} in {ns})")
+        pod = ready[0].metadata.name
+        resp = stream(
+            v1.connect_get_namespaced_pod_exec,
+            pod, ns, command=cmd,
+            stderr=False, stdin=False, stdout=True, tty=False,
+            _preload_content=False,
+        )
+        out = bytearray()
+        # Drain the stream until the exec finishes.
+        while resp.is_open():
+            resp.update(timeout=1)
+            if resp.peek_stdout():
+                out.extend(resp.read_stdout().encode("utf-8", "replace"))
+        resp.close()
+        return bytes(out)
+
+    return await asyncio.wait_for(asyncio.to_thread(_run), timeout=timeout)
+
+
+async def _nuclei_exec_in_container(container: str, cmd: list, timeout: float) -> bytes:
+    """Run `cmd` inside a long-lived nuclei sidecar via the Docker API.
+
+    Uses docker-py (talks to the mounted /var/run/docker.sock — no docker
+    CLI binary needed in the API image). docker-py is synchronous, so the
+    blocking exec is pushed to a thread. Returns the combined stdout bytes
+    (nuclei JSONL). Raises on missing container / socket so the caller
+    degrades to passive.
+    """
+    import docker  # local import — optional dep, only needed for this path
+
+    def _run() -> bytes:
+        client = docker.from_env()
+        cont = client.containers.get(container)
+        # demux=False → single interleaved stream; nuclei writes JSONL to
+        # stdout with -silent, so stderr noise is minimal.
+        _code, output = cont.exec_run(cmd, stdout=True, stderr=False, demux=False)
+        return output or b""
+
+    return await asyncio.wait_for(asyncio.to_thread(_run), timeout=timeout)
+
+
 async def _run_nuclei_scan(scan: SecurityScan) -> None:
     """ProjectDiscovery Nuclei — real active template-based vuln scan.
 
@@ -249,14 +327,16 @@ async def _run_nuclei_scan(scan: SecurityScan) -> None:
     any failure so a scan always returns something useful.
     """
     import json
+    import shutil
 
     scan.status = "running"
     scan.started_at = datetime.now(timezone.utc)
     await scan.save()
 
-    cmd = [
-        "docker", "run", "--rm", "--network", "host",
-        settings.SECURITY_SCAN_NUCLEI_IMAGE,
+    # Prefer a nuclei BINARY on PATH (baked into the image / installed) —
+    # portable + works in k8s. Fall back to `docker run` only when the
+    # binary is absent AND a docker socket is reachable.
+    nuclei_args = [
         "-u", scan.target_url,
         "-jsonl",                                   # one JSON object per line
         "-silent",                                  # suppress banner/progress
@@ -265,17 +345,36 @@ async def _run_nuclei_scan(scan: SecurityScan) -> None:
         "-no-color",
     ]
     if settings.SECURITY_SCAN_NUCLEI_TAGS.strip():
-        cmd += ["-tags", settings.SECURITY_SCAN_NUCLEI_TAGS.strip()]
+        nuclei_args += ["-tags", settings.SECURITY_SCAN_NUCLEI_TAGS.strip()]
 
+    timeout = float(settings.SECURITY_SCAN_NUCLEI_TIMEOUT)
+    mode = _nuclei_mode()
     try:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, _stderr = await asyncio.wait_for(
-            proc.communicate(), timeout=float(settings.SECURITY_SCAN_NUCLEI_TIMEOUT)
-        )
+        if mode == "k8s":
+            # Prod: exec into the nuclei runner POD over the k8s API.
+            stdout = await _nuclei_exec_in_pod(["nuclei", *nuclei_args], timeout)
+        elif mode == "docker" and settings.SECURITY_SCAN_NUCLEI_CONTAINER:
+            # Local docker-compose: exec into the sidecar over the Docker API.
+            stdout = await _nuclei_exec_in_container(
+                settings.SECURITY_SCAN_NUCLEI_CONTAINER,
+                ["nuclei", *nuclei_args], timeout,
+            )
+        else:
+            # Local fallbacks: nuclei binary on PATH, else `docker run`.
+            if shutil.which("nuclei"):
+                cmd = ["nuclei", *nuclei_args]
+            else:
+                cmd = [
+                    "docker", "run", "--rm", "--network", "host",
+                    settings.SECURITY_SCAN_NUCLEI_IMAGE, *nuclei_args,
+                ]
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            raw, _stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+            stdout = raw
 
         findings: List[Finding] = []
         for line in stdout.decode("utf-8", "replace").splitlines():
