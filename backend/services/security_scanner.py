@@ -340,12 +340,28 @@ async def _run_nuclei_scan(scan: SecurityScan) -> None:
         "-u", scan.target_url,
         "-jsonl",                                   # one JSON object per line
         "-silent",                                  # suppress banner/progress
-        "-severity", settings.SECURITY_SCAN_NUCLEI_SEVERITY,
-        "-rate-limit", str(settings.SECURITY_SCAN_NUCLEI_RATE),
         "-no-color",
+        "-severity", settings.SECURITY_SCAN_NUCLEI_SEVERITY,
+        # --- speed flags ---
+        "-rate-limit", str(settings.SECURITY_SCAN_NUCLEI_RATE),
+        "-c", str(settings.SECURITY_SCAN_NUCLEI_CONCURRENCY),
+        "-timeout", str(settings.SECURITY_SCAN_NUCLEI_REQ_TIMEOUT),
+        "-retries", str(settings.SECURITY_SCAN_NUCLEI_RETRIES),
+        "-disable-update-check",                    # no version-check round-trip
+        "-duc",                                     # no template auto-update mid-scan
     ]
+    # FAST profile: scope to high-signal template dirs (~10x fewer than the
+    # full set). Empty → run everything (deep audit).
+    for t in settings.SECURITY_SCAN_NUCLEI_TEMPLATES.split(","):
+        t = t.strip()
+        if t:
+            nuclei_args += ["-t", t]
     if settings.SECURITY_SCAN_NUCLEI_TAGS.strip():
         nuclei_args += ["-tags", settings.SECURITY_SCAN_NUCLEI_TAGS.strip()]
+    if settings.SECURITY_SCAN_NUCLEI_EXCLUDE_TAGS.strip():
+        nuclei_args += ["-etags", settings.SECURITY_SCAN_NUCLEI_EXCLUDE_TAGS.strip()]
+    if settings.SECURITY_SCAN_NUCLEI_NO_INTERACTSH:
+        nuclei_args += ["-no-interactsh"]
 
     timeout = float(settings.SECURITY_SCAN_NUCLEI_TIMEOUT)
     mode = _nuclei_mode()

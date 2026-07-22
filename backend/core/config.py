@@ -134,11 +134,28 @@ class Settings(BaseSettings):
     # k8s mode: where the nuclei runner pod lives + how to find it.
     SECURITY_SCAN_NUCLEI_K8S_NAMESPACE: str = "pulse-api"
     SECURITY_SCAN_NUCLEI_K8S_SELECTOR: str = "app=nuclei"
-    SECURITY_SCAN_NUCLEI_RATE: int = 50       # max requests/sec (-rl)
+    SECURITY_SCAN_NUCLEI_RATE: int = 150      # max requests/sec (-rl)
     SECURITY_SCAN_NUCLEI_SEVERITY: str = "low,medium,high,critical"  # skip info noise
     # Optional extra template tags/filters (e.g. "cves,exposures,misconfig").
     # Empty = nuclei's default template set.
     SECURITY_SCAN_NUCLEI_TAGS: str = ""
+    # --- speed tuning ---
+    # Template concurrency (nuclei default 25). Higher = faster on one host.
+    SECURITY_SCAN_NUCLEI_CONCURRENCY: int = 100
+    # Per-request timeout + retries — fail fast on dead paths.
+    SECURITY_SCAN_NUCLEI_REQ_TIMEOUT: int = 5
+    SECURITY_SCAN_NUCLEI_RETRIES: int = 1
+    # Tag groups to exclude — the slowest / most intrusive families.
+    SECURITY_SCAN_NUCLEI_EXCLUDE_TAGS: str = "dos,fuzz,headless,intrusive"
+    # Skip blind out-of-band checks (removes interactsh callback-poll wait).
+    # Flip to False if you self-host interactsh and want blind SSRF/RCE.
+    SECURITY_SCAN_NUCLEI_NO_INTERACTSH: bool = True
+    # FAST profile: restrict to the high-signal template dirs instead of
+    # the full ~9k set. ~10x faster, same real-vuln coverage. Empty runs
+    # everything (deep audit). Comma-separated -t paths.
+    SECURITY_SCAN_NUCLEI_TEMPLATES: str = (
+        "http/cves,http/exposures,http/misconfiguration,http/vulnerabilities,http/default-logins"
+    )
     # Dedicated Discord channel for high/critical findings. Falls back
     # to DISCORD_DB_ALERT_WEBHOOK_URL when empty.
     DISCORD_SECURITY_WEBHOOK_URL: str = ""
