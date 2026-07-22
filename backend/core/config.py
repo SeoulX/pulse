@@ -107,6 +107,14 @@ class Settings(BaseSettings):
     # banner) always runs — pure httpx, no external deps. Non-intrusive
     # by design: only scans targets in Pulse's owned-asset allowlist.
     SECURITY_SCAN_TIMEOUT: int = 15           # per-request seconds (passive)
+    # Custom (pasted-URL) targets. When enabled, an admin can scan a URL
+    # that isn't in the deployment inventory — but ONLY if its host ends
+    # with one of SECURITY_SCAN_CUSTOM_DOMAINS. This keeps scans confined
+    # to org-owned infra (a new/unmonitored internal app) instead of
+    # opening the door to arbitrary third-party targets. Empty domain list
+    # + enabled = allow any host (NOT recommended — off by default).
+    SECURITY_SCAN_ALLOW_CUSTOM_TARGET: bool = True
+    SECURITY_SCAN_CUSTOM_DOMAINS: str = "media-meter.in,seven-gen.com,scoup.app"
     # OWASP ZAP baseline (optional heavier engine). Needs docker reachable
     # from the API container. Disabled by default → engine falls back to
     # passive. The ZAP baseline profile is itself non-destructive.

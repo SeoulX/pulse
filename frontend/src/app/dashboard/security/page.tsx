@@ -78,6 +78,7 @@ export default function SecurityPage() {
   const [targets, setTargets] = useState<ScanTarget[]>([]);
   const [scans, setScans] = useState<Scan[]>([]);
   const [selectedUrl, setSelectedUrl] = useState<string>("");
+  const [customMode, setCustomMode] = useState(false);
   const [engine, setEngine] = useState<"passive" | "nuclei" | "zap">("passive");
   const [profile, setProfile] = useState<"fast" | "deep">("fast");
   const [authHeader, setAuthHeader] = useState("");
@@ -196,19 +197,37 @@ export default function SecurityPage() {
         </div>
         <div className="flex flex-wrap items-end gap-3">
           <label className="flex flex-col gap-1">
-            <span className="text-xs text-muted-foreground">Target (owned assets)</span>
-            <select
-              value={selectedUrl}
-              onChange={(e) => setSelectedUrl(e.target.value)}
-              className="min-w-72 rounded-xl border bg-background px-3 py-2 text-sm"
+            <span className="text-xs text-muted-foreground">
+              Target {customMode ? "(paste a URL)" : "(owned assets)"}
+            </span>
+            {customMode ? (
+              <input
+                value={selectedUrl}
+                onChange={(e) => setSelectedUrl(e.target.value)}
+                placeholder="https://your-app.media-meter.in"
+                className="min-w-72 rounded-xl border bg-background px-3 py-2 font-mono text-sm"
+              />
+            ) : (
+              <select
+                value={selectedUrl}
+                onChange={(e) => setSelectedUrl(e.target.value)}
+                className="min-w-72 rounded-xl border bg-background px-3 py-2 text-sm"
+              >
+                <option value="">Select a target…</option>
+                {targets.map((t) => (
+                  <option key={t.url} value={t.url}>
+                    {t.label} — {t.url}
+                  </option>
+                ))}
+              </select>
+            )}
+            <button
+              type="button"
+              onClick={() => { setCustomMode((v) => !v); setSelectedUrl(""); }}
+              className="mt-0.5 self-start text-[11px] text-[#e8871e] hover:underline dark:text-[#5ab4c5]"
             >
-              <option value="">Select a target…</option>
-              {targets.map((t) => (
-                <option key={t.url} value={t.url}>
-                  {t.label} — {t.url}
-                </option>
-              ))}
-            </select>
+              {customMode ? "← pick from owned assets" : "not listed? paste a URL →"}
+            </button>
           </label>
           <label className="flex flex-col gap-1">
             <span className="text-xs text-muted-foreground">Engine</span>

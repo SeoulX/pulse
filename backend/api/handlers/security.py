@@ -145,16 +145,51 @@ class CreateScanRequest(BaseModel):
     model_config = {"populate_by_name": True}
 
 
+def _custom_target_allowed(url: str) -> Optional["ScanTarget"]:
+    """Vet a pasted URL. Returns a ScanTarget when custom scanning is
+    enabled AND the host is under an org domain; None otherwise.
+
+    Keeps custom scans confined to org-owned infra — a pasted URL can
+    only target hosts ending in SECURITY_SCAN_CUSTOM_DOMAINS, so this
+    can't be used to scan arbitrary third-party sites."""
+    from core.config import settings
+    from urllib.parse import urlparse
+
+    if not settings.SECURITY_SCAN_ALLOW_CUSTOM_TARGET:
+        return None
+    if not url.startswith(("http://", "https://")):
+        return None
+    host = (urlparse(url).hostname or "").lower()
+    if not host:
+        return None
+    domains = [d.strip().lower() for d in settings.SECURITY_SCAN_CUSTOM_DOMAINS.split(",") if d.strip()]
+    if domains and not any(host == d or host.endswith("." + d) for d in domains):
+        return None
+    return ScanTarget(kind="custom", ref=None, label=f"{host} (custom)", url=url)
+
+
 @router.post("/scans", status_code=201)
 async def create_scan(body: CreateScanRequest, admin: User = Depends(require_admin)):
-    # Enforce the allowlist — the ONLY way to pick a target.
+    # 1) Owned-asset allowlist (deployments + monitored endpoints).
     allowed = {t.url: t for t in await _resolve_targets()}
     target = allowed.get(body.target_url)
+    # 2) Fallback: a pasted URL, but only under an org domain.
     if not target:
+        target = _custom_target_allowed(body.target_url)
+    if not target:
+        from core.config import settings
         raise HTTPException(
             status_code=403,
-            detail="Target not in the owned-asset allowlist. Scan only apps Pulse deployed "
-                   "or monitors. See GET /api/security/targets.",
+            detail=(
+                "Target not allowed. Scan an app Pulse deployed/monitors "
+                "(GET /api/security/targets)"
+                + (
+                    f", or paste a URL under an org domain "
+                    f"({settings.SECURITY_SCAN_CUSTOM_DOMAINS})."
+                    if settings.SECURITY_SCAN_ALLOW_CUSTOM_TARGET
+                    else "."
+                )
+            ),
         )
     if body.engine not in ("passive", "zap", "nuclei"):
         raise HTTPException(status_code=400, detail="engine must be 'passive', 'nuclei', or 'zap'")

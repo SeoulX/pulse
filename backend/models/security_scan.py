@@ -41,7 +41,7 @@ class SecurityScan(Document):
     # `target_kind` records how the target was authorized:
     #   endpoint   → a monitored Endpoint document (Pulse already probes it)
     #   deployment → derived from a DeploymentRequest's domain/port
-    target_kind: Literal["endpoint", "deployment"] = Field(alias="targetKind")
+    target_kind: Literal["endpoint", "deployment", "custom"] = Field(alias="targetKind")
     target_ref: Optional[str] = Field(default=None, alias="targetRef")  # source doc id
     target_label: str = Field(alias="targetLabel")  # human name (repo slug / endpoint name)
     target_url: Indexed(str) = Field(alias="targetUrl")
