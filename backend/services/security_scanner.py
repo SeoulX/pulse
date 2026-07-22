@@ -266,10 +266,29 @@ async def _nuclei_exec_in_pod(cmd: list, timeout: float) -> bytes:
 
     ns = settings.SECURITY_SCAN_NUCLEI_K8S_NAMESPACE
     selector = settings.SECURITY_SCAN_NUCLEI_K8S_SELECTOR
+    _SA_TOKEN = "/var/run/secrets/kubernetes.io/serviceaccount/token"
 
     def _run() -> bytes:
         k8s_config.load_incluster_config()
-        v1 = client.CoreV1Api()
+        cfg = client.Configuration.get_default_copy()
+        # kubernetes-client 36 + k3s auth fix. load_incluster_config stores
+        # the SA token as api_key['authorization']='bearer <tok>' (lowercase
+        # 'bearer', which k3s's case-sensitive "Bearer " strip rejects) and
+        # the generated auth setting looks it up under the 'BearerToken'
+        # key. Net effect: REST calls 401, and the websocket exec handshake
+        # raises an ApiException whose None body then crashes the client's
+        # error handler (AttributeError). Rebuild the token under BOTH keys
+        # with a capital-B 'Bearer' prefix, and set it as the DEFAULT config
+        # so the websocket handshake (which reads the default) authenticates.
+        try:
+            with open(_SA_TOKEN) as fh:
+                token = fh.read().strip()
+            cfg.api_key = {"authorization": token, "BearerToken": token}
+            cfg.api_key_prefix = {"authorization": "Bearer", "BearerToken": "Bearer"}
+            client.Configuration.set_default(cfg)
+        except OSError:
+            pass  # not in-cluster — leave whatever load_incluster set
+        v1 = client.CoreV1Api(client.ApiClient(cfg))
         pods = v1.list_namespaced_pod(ns, label_selector=selector).items
         ready = [p for p in pods if (p.status and p.status.phase == "Running")]
         if not ready:
