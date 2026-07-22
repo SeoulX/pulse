@@ -220,14 +220,110 @@ async def _maybe_alert(scan: SecurityScan) -> None:
 
 
 async def dispatch_scan(scan: SecurityScan) -> None:
-    """Route to the requested engine. Passive is always available;
-    ZAP requires the container + SECURITY_SCAN_ZAP_ENABLED."""
-    if scan.engine == "zap" and settings.SECURITY_SCAN_ZAP_ENABLED:
+    """Route to the requested engine. Passive is always available; nuclei
+    and ZAP require their container + the matching *_ENABLED flag, and
+    degrade to passive when unavailable."""
+    if scan.engine == "nuclei" and settings.SECURITY_SCAN_NUCLEI_ENABLED:
+        await _run_nuclei_scan(scan)
+    elif scan.engine == "zap" and settings.SECURITY_SCAN_ZAP_ENABLED:
         await _run_zap_scan(scan)
     else:
         # Fall back to passive for any engine we can't run here.
         scan.engine = "passive"
         await run_passive_scan(scan)
+
+
+# Nuclei severity strings map 1:1 onto our ladder.
+_NUCLEI_SEV = {"critical", "high", "medium", "low", "info"}
+
+
+async def _run_nuclei_scan(scan: SecurityScan) -> None:
+    """ProjectDiscovery Nuclei — real active template-based vuln scan.
+
+    Runs the nuclei container against the target with JSONL output, a
+    request rate limit, and a severity filter. Each JSON line becomes a
+    Finding. Templates are detection-oriented (CVEs, misconfigurations,
+    exposures, default credentials) rather than destructive exploits —
+    still, we only ever point it at Pulse-owned assets (enforced upstream
+    by the allowlist) and cap the request rate. Degrades to passive on
+    any failure so a scan always returns something useful.
+    """
+    import json
+
+    scan.status = "running"
+    scan.started_at = datetime.now(timezone.utc)
+    await scan.save()
+
+    cmd = [
+        "docker", "run", "--rm", "--network", "host",
+        settings.SECURITY_SCAN_NUCLEI_IMAGE,
+        "-u", scan.target_url,
+        "-jsonl",                                   # one JSON object per line
+        "-silent",                                  # suppress banner/progress
+        "-severity", settings.SECURITY_SCAN_NUCLEI_SEVERITY,
+        "-rate-limit", str(settings.SECURITY_SCAN_NUCLEI_RATE),
+        "-no-color",
+    ]
+    if settings.SECURITY_SCAN_NUCLEI_TAGS.strip():
+        cmd += ["-tags", settings.SECURITY_SCAN_NUCLEI_TAGS.strip()]
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _stderr = await asyncio.wait_for(
+            proc.communicate(), timeout=float(settings.SECURITY_SCAN_NUCLEI_TIMEOUT)
+        )
+
+        findings: List[Finding] = []
+        for line in stdout.decode("utf-8", "replace").splitlines():
+            line = line.strip()
+            if not line or not line.startswith("{"):
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            info = obj.get("info") or {}
+            sev = (info.get("severity") or "info").lower()
+            if sev not in _NUCLEI_SEV:
+                sev = "info"
+            # Nuclei classification / remediation live under info.*
+            classification = info.get("classification") or {}
+            cve = ", ".join(classification.get("cve-id") or []) if classification else ""
+            remediation = info.get("remediation") or (
+                f"Review + patch. Template: {obj.get('template-id', '?')}."
+                + (f" CVE: {cve}." if cve else "")
+            )
+            findings.append(Finding(
+                rule_id=f"nuclei-{obj.get('template-id', 'x')}",
+                severity=sev,  # type: ignore[arg-type]
+                title=info.get("name") or obj.get("template-id") or "Nuclei finding",
+                detail=(info.get("description") or "")[:600],
+                evidence=obj.get("matched-at") or obj.get("host"),
+                remediation=remediation[:600],
+                engine="nuclei",
+            ))
+
+        scan.findings = findings
+        scan.recompute()
+        scan.status = "completed"
+    except Exception as e:
+        # Nuclei / docker unavailable → run the always-on passive engine so
+        # the scan still yields posture findings.
+        scan.error = f"nuclei unavailable ({e.__class__.__name__}); ran passive instead"
+        scan.engine = "passive"
+        await run_passive_scan(scan)
+        return
+
+    scan.finished_at = datetime.now(timezone.utc)
+    await scan.save()
+    try:
+        await _maybe_alert(scan)
+    except Exception:
+        pass
 
 
 async def _run_zap_scan(scan: SecurityScan) -> None:

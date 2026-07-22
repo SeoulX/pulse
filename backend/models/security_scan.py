@@ -9,9 +9,13 @@ Severity = Literal["critical", "high", "medium", "low", "info"]
 SEVERITY_ORDER = {"critical": 4, "high": 3, "medium": 2, "low": 1, "info": 0}
 
 ScanStatus = Literal["queued", "running", "completed", "failed"]
-# Which engine produced the run. `passive` = built-in pure-python
-# baseline (security headers, TLS, cookies, banner). `zap` = OWASP ZAP
-# baseline container (active but non-destructive). Others reserved.
+# Which engine produced the run.
+#   passive = built-in pure-python baseline (headers, TLS, cookies, banner).
+#             Non-intrusive — GET/HEAD only.
+#   nuclei  = ProjectDiscovery Nuclei — real active template-based vuln
+#             scanning (CVEs, misconfig, exposures, default creds). Thousands
+#             of community templates. Rate-limited + severity-filtered.
+#   zap     = OWASP ZAP baseline container (passive spider + rules).
 ScanEngine = Literal["passive", "zap", "nuclei"]
 
 

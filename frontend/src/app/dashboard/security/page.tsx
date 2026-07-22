@@ -77,7 +77,7 @@ export default function SecurityPage() {
   const [targets, setTargets] = useState<ScanTarget[]>([]);
   const [scans, setScans] = useState<Scan[]>([]);
   const [selectedUrl, setSelectedUrl] = useState<string>("");
-  const [engine, setEngine] = useState<"passive" | "zap">("passive");
+  const [engine, setEngine] = useState<"passive" | "nuclei" | "zap">("passive");
   const [launching, setLaunching] = useState(false);
   const [detail, setDetail] = useState<Scan | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -194,10 +194,11 @@ export default function SecurityPage() {
             <span className="text-xs text-muted-foreground">Engine</span>
             <select
               value={engine}
-              onChange={(e) => setEngine(e.target.value as "passive" | "zap")}
+              onChange={(e) => setEngine(e.target.value as "passive" | "nuclei" | "zap")}
               className="rounded-xl border bg-background px-3 py-2 text-sm"
             >
-              <option value="passive">Passive (built-in, non-intrusive)</option>
+              <option value="passive">Passive (built-in · headers/TLS/cookies · non-intrusive)</option>
+              <option value="nuclei">Nuclei (active vuln scan · CVEs/misconfig · if enabled)</option>
               <option value="zap">OWASP ZAP baseline (if enabled)</option>
             </select>
           </label>

@@ -148,8 +148,8 @@ async def create_scan(body: CreateScanRequest, admin: User = Depends(require_adm
             detail="Target not in the owned-asset allowlist. Scan only apps Pulse deployed "
                    "or monitors. See GET /api/security/targets.",
         )
-    if body.engine not in ("passive", "zap"):
-        raise HTTPException(status_code=400, detail="engine must be 'passive' or 'zap'")
+    if body.engine not in ("passive", "zap", "nuclei"):
+        raise HTTPException(status_code=400, detail="engine must be 'passive', 'nuclei', or 'zap'")
 
     scan = SecurityScan(
         target_kind=target.kind,

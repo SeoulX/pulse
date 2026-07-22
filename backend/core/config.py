@@ -113,6 +113,19 @@ class Settings(BaseSettings):
     SECURITY_SCAN_ZAP_ENABLED: bool = False
     SECURITY_SCAN_ZAP_IMAGE: str = "ghcr.io/zaproxy/zaproxy:stable"
     SECURITY_SCAN_ZAP_TIMEOUT: int = 600      # whole-run seconds
+    # Nuclei — real active template-based vuln scanning (ProjectDiscovery).
+    # Needs docker reachable from the API container. Disabled by default →
+    # engine falls back to passive. Nuclei's default templates are
+    # detection-oriented (not destructive exploitation); we still
+    # rate-limit + severity-filter for safety on owned staging targets.
+    SECURITY_SCAN_NUCLEI_ENABLED: bool = False
+    SECURITY_SCAN_NUCLEI_IMAGE: str = "projectdiscovery/nuclei:latest"
+    SECURITY_SCAN_NUCLEI_TIMEOUT: int = 900   # whole-run seconds
+    SECURITY_SCAN_NUCLEI_RATE: int = 50       # max requests/sec (-rl)
+    SECURITY_SCAN_NUCLEI_SEVERITY: str = "low,medium,high,critical"  # skip info noise
+    # Optional extra template tags/filters (e.g. "cves,exposures,misconfig").
+    # Empty = nuclei's default template set.
+    SECURITY_SCAN_NUCLEI_TAGS: str = ""
     # Dedicated Discord channel for high/critical findings. Falls back
     # to DISCORD_DB_ALERT_WEBHOOK_URL when empty.
     DISCORD_SECURITY_WEBHOOK_URL: str = ""
