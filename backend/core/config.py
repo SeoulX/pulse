@@ -114,7 +114,10 @@ class Settings(BaseSettings):
     # opening the door to arbitrary third-party targets. Empty domain list
     # + enabled = allow any host (NOT recommended — off by default).
     SECURITY_SCAN_ALLOW_CUSTOM_TARGET: bool = True
-    SECURITY_SCAN_CUSTOM_DOMAINS: str = "media-meter.in,seven-gen.com,scoup.app"
+    SECURITY_SCAN_CUSTOM_DOMAINS: str = (
+        "media-meter.in,media-meter.com,seven-gen.com,scoup.app,"
+        "salina.app,remote-cloud.com,downlodr.com,kubito.dev"
+    )
     # OWASP ZAP baseline (optional heavier engine). Needs docker reachable
     # from the API container. Disabled by default → engine falls back to
     # passive. The ZAP baseline profile is itself non-destructive.
