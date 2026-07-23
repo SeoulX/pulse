@@ -19,6 +19,7 @@ import {
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 
+// Visible to every signed-in user, viewers included.
 const navItems = [
   { href: "/dashboard", label: "Overview", icon: LayoutDashboard },
   { href: "/dashboard/projects", label: "Projects", icon: FolderOpen },
@@ -26,12 +27,16 @@ const navItems = [
   { href: "/dashboard/notifications", label: "Notifications", icon: Bell },
   { href: "/dashboard/analytics", label: "AI Analytics", icon: Brain },
   { href: "/dashboard/deployments", label: "Deployments", icon: Rocket },
+];
+
+// Admin-only. These expose infrastructure credentials (Databases,
+// Secrets) or can actively attack hosts (Security/pen-test), so they're
+// hidden from viewers here AND enforced server-side by require_admin —
+// hiding the link alone is not access control.
+const adminItems = [
   { href: "/dashboard/databases", label: "Databases", icon: Database },
   { href: "/dashboard/infisical", label: "Secrets", icon: KeyRound },
   { href: "/dashboard/security", label: "Security", icon: ShieldCheck },
-];
-
-const adminItems = [
   { href: "/dashboard/users", label: "Users", icon: Users },
 ];
 

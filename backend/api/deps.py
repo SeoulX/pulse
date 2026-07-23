@@ -21,6 +21,15 @@ async def get_current_user(
     if not user:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
 
+    # Checked on every request, not just at login: a token minted before
+    # an admin revoked/rejected the account would otherwise stay valid
+    # until it expired.
+    if user.status != "approved":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Account is not approved",
+        )
+
     return user
 
 

@@ -18,7 +18,7 @@ from beanie import PydanticObjectId
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
-from api.deps import get_current_user, require_admin
+from api.deps import require_admin
 from models.deployment import DeploymentRequest
 from models.endpoint import Endpoint
 from models.security_scan import SecurityScan
@@ -126,7 +126,7 @@ def _serialize(scan: SecurityScan, *, full: bool = False) -> dict:
 # ---------------------------------------------------------------------------
 
 @router.get("/targets")
-async def list_targets(user: User = Depends(get_current_user)):
+async def list_targets(admin: User = Depends(require_admin)):
     """The scan allowlist — every asset Pulse owns + can scan."""
     return [t.model_dump() for t in await _resolve_targets()]
 
@@ -217,13 +217,13 @@ async def create_scan(body: CreateScanRequest, admin: User = Depends(require_adm
 
 
 @router.get("/scans")
-async def list_scans(user: User = Depends(get_current_user)):
+async def list_scans(admin: User = Depends(require_admin)):
     scans = await SecurityScan.find_all().sort("-created_at").limit(100).to_list()
     return [_serialize(s) for s in scans]
 
 
 @router.get("/scans/{scan_id}")
-async def get_scan(scan_id: str, user: User = Depends(get_current_user)):
+async def get_scan(scan_id: str, admin: User = Depends(require_admin)):
     scan = await SecurityScan.get(PydanticObjectId(scan_id))
     if not scan:
         raise HTTPException(status_code=404, detail="Scan not found")

@@ -2,7 +2,7 @@
 
 import { useState } from "react";
 import { useRouter } from "next/navigation";
-import { Activity } from "lucide-react";
+import { Activity, Clock } from "lucide-react";
 import { ThemeToggle } from "@/components/theme-toggle";
 import { useAuth } from "@/components/auth-context";
 
@@ -12,17 +12,30 @@ export default function LoginPage() {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState("");
+  const [notice, setNotice] = useState("");
   const [loading, setLoading] = useState(false);
   const [isRegistering, setIsRegistering] = useState(false);
+  const [submitted, setSubmitted] = useState(false);
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
     setLoading(true);
     setError("");
+    setNotice("");
 
     try {
       if (isRegistering) {
-        await register(email, password);
+        const result = await register(email, password);
+        // Self-signup lands in the approval queue — logging in would
+        // just 403. Show the confirmation and stop here. The only
+        // exception is the bootstrap admin (first user ever), which the
+        // API auto-approves.
+        if (result.status !== "approved") {
+          setSubmitted(true);
+          setNotice(result.message);
+          setPassword("");
+          return;
+        }
       }
 
       await login(email, password);
@@ -32,6 +45,13 @@ export default function LoginPage() {
     } finally {
       setLoading(false);
     }
+  }
+
+  function switchMode() {
+    setIsRegistering(!isRegistering);
+    setError("");
+    setNotice("");
+    setSubmitted(false);
   }
 
   return (
@@ -55,6 +75,25 @@ export default function LoginPage() {
           </div>
         )}
 
+        {notice && (
+          <div className="flex gap-2.5 rounded-xl bg-amber-50 p-3 text-sm text-amber-800 dark:bg-amber-900/20 dark:text-amber-300">
+            <Clock className="mt-0.5 h-4 w-4 shrink-0" />
+            <span>{notice}</span>
+          </div>
+        )}
+
+        {submitted ? (
+          <button
+            onClick={() => {
+              setSubmitted(false);
+              setIsRegistering(false);
+              setNotice("");
+            }}
+            className="w-full rounded-xl bg-[#1a1a1a] px-4 py-2.5 text-sm font-medium text-white shadow-sm transition-colors hover:bg-[#2d1b0e] dark:bg-[#164e63] dark:hover:bg-[#0c2d3f]"
+          >
+            Back to Log In
+          </button>
+        ) : (
         <form onSubmit={handleSubmit} className="space-y-4">
           <div>
             <label className="mb-1.5 block text-sm font-medium">Email</label>
@@ -93,16 +132,25 @@ export default function LoginPage() {
                 ? "Create Account"
                 : "Log In"}
           </button>
-        </form>
 
-        <button
-          onClick={() => setIsRegistering(!isRegistering)}
-          className="w-full text-center text-sm text-muted-foreground transition-colors hover:text-[#e8871e] dark:hover:text-[#5ab4c5]"
-        >
-          {isRegistering
-            ? "Already have an account? Log in"
-            : "First time? Create an account"}
-        </button>
+          {isRegistering && (
+            <p className="text-center text-xs text-muted-foreground">
+              New accounts require admin approval before you can log in.
+            </p>
+          )}
+        </form>
+        )}
+
+        {!submitted && (
+          <button
+            onClick={switchMode}
+            className="w-full text-center text-sm text-muted-foreground transition-colors hover:text-[#e8871e] dark:hover:text-[#5ab4c5]"
+          >
+            {isRegistering
+              ? "Already have an account? Log in"
+              : "First time? Create an account"}
+          </button>
+        )}
 
       </div>
     </div>

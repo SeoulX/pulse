@@ -10,6 +10,7 @@ export default function UsersPage() {
   const [showForm, setShowForm] = useState(false);
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
+  const [role, setRole] = useState("viewer");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const { mutate } = useSWRConfig();
@@ -20,15 +21,18 @@ export default function UsersPage() {
     setError("");
 
     try {
-      const res = await apiFetch("/api/auth/register", {
+      // Admin-created users go through POST /users, not /auth/register —
+      // that path auto-approves them (an admin creating the account IS
+      // the approval), whereas self-signup lands in the pending queue.
+      const res = await apiFetch("/api/users", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ email, password }),
+        body: JSON.stringify({ email, password, role }),
       });
 
       if (!res.ok) {
         const data = await res.json();
-        throw new Error(data.error || "Failed to create user");
+        throw new Error(data.detail || data.error || "Failed to create user");
       }
 
       setEmail("");
@@ -82,6 +86,17 @@ export default function UsersPage() {
             onChange={(e) => setPassword(e.target.value)}
             className="w-full rounded-xl border bg-background px-4 py-2.5 text-sm outline-none transition-all focus:border-[#e8871e] focus:ring-2 focus:ring-[#e8871e]/20 dark:focus:border-[#2a7f9e] dark:focus:ring-[#2a7f9e]/20"
           />
+          <select
+            value={role}
+            onChange={(e) => setRole(e.target.value)}
+            className="w-full rounded-xl border bg-background px-4 py-2.5 text-sm outline-none transition-all focus:border-[#e8871e] focus:ring-2 focus:ring-[#e8871e]/20 dark:focus:border-[#2a7f9e] dark:focus:ring-[#2a7f9e]/20"
+          >
+            <option value="viewer">Viewer</option>
+            <option value="admin">Admin</option>
+          </select>
+          <p className="text-xs text-muted-foreground">
+            Admin-created accounts are approved automatically.
+          </p>
           <div className="flex gap-2">
             <button
               type="button"

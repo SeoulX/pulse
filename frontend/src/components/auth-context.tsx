@@ -7,13 +7,23 @@ interface AuthUser {
   id: string;
   email: string;
   role: string;
+  status?: string;
+}
+
+export interface RegisterResult {
+  id: string;
+  email: string;
+  role: string;
+  // "pending" = needs admin approval before login works.
+  status: string;
+  message: string;
 }
 
 interface AuthContextType {
   user: AuthUser | null;
   status: "loading" | "authenticated" | "unauthenticated";
   login: (email: string, password: string) => Promise<void>;
-  register: (email: string, password: string) => Promise<void>;
+  register: (email: string, password: string) => Promise<RegisterResult>;
   logout: () => void;
 }
 
@@ -21,7 +31,7 @@ const AuthContext = createContext<AuthContextType>({
   user: null,
   status: "loading",
   login: async () => {},
-  register: async () => {},
+  register: async () => ({ id: "", email: "", role: "", status: "", message: "" }),
   logout: () => {},
 });
 
@@ -73,7 +83,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     await fetchMe();
   };
 
-  const register = async (email: string, password: string) => {
+  const register = async (email: string, password: string): Promise<RegisterResult> => {
     const res = await fetch(`${API_URL}/api/auth/register`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -83,6 +93,9 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       const data = await res.json();
       throw new Error(data.detail || "Registration failed");
     }
+    // Caller inspects `status`: "pending" means an admin must approve
+    // before login will succeed, so don't try to log in.
+    return res.json();
   };
 
   const logout = () => {
